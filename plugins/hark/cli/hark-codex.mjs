@@ -23,8 +23,7 @@ import { HarkApiError, HarkServiceClient } from '../lib/service-client.mjs';
 import {
   installPinnedCodexRuntime,
   managedCodexPath,
-  PINNED_CODEX_RUNTIME,
-  verifyFileSha256,
+  verifyPinnedCodexRuntime,
 } from '../lib/pinned-codex-runtime.mjs';
 import { HarkCodexSupervisor } from '../lib/supervisor.mjs';
 import { openSupervisorLogs, SupervisorProcessLock } from '../lib/supervisor-process.mjs';
@@ -247,6 +246,7 @@ export async function createSupervisorRuntime(options = {}, dependencies = {}) {
   const runtimeId = await journal.ensureRuntimeId(() => credentials.installation.runtimeId);
   if (runtimeId !== credentials.installation.runtimeId) throw new Error('installation_runtime_mismatch');
   const command = configuredCodexCommand(options, dependencies);
+  await (dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime)(command);
   const transportFactory = dependencies.transportFactory
     ?? createCodexDaemonTransportFactory({ command });
   const appServerClientFactory = dependencies.appServerClientFactory
@@ -328,20 +328,15 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
   let command;
   if (explicitCommand) {
     command = explicitCommand;
-    await (dependencies.verifyFileSha256 ?? verifyFileSha256)(
-      command,
-      PINNED_CODEX_RUNTIME.executableSha256,
-      {
-        mismatchCode: 'CODEX_EXECUTABLE_SHA256_MISMATCH',
-        label: 'Configured Codex executable',
-      },
-    );
   } else {
     const installed = await (
       dependencies.installPinnedCodexRuntime ?? installPinnedCodexRuntime
     )({ codexHome: codexHome(options, dependencies) });
     command = installed.path;
   }
+  const runtime = await (
+    dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime
+  )(command);
   const execute = dependencies.runProcess ?? runProcess;
   const versionResult = await execute(command, ['--version']);
   const versionOutput = `${versionResult?.stdout ?? ''}\n${versionResult?.stderr ?? ''}`;
@@ -362,7 +357,12 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
   if (inspection.managedCodexPath && inspection.managedCodexPath !== command) {
     throw new Error('codex_managed_path_mismatch');
   }
-  return { ...inspection, harkCodexPath: command };
+  return {
+    ...inspection,
+    harkCodexPath: command,
+    codeModeHostPath: runtime.codeModeHostPath,
+    codeModeHostSha256: runtime.codeModeHostSha256,
+  };
 }
 
 export async function ensureCommand(options = {}, dependencies = {}) {
@@ -370,6 +370,12 @@ export async function ensureCommand(options = {}, dependencies = {}) {
   const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
   const credentials = await credentialsStore.read();
   if (!credentials) return { started: false, reason: 'not_connected' };
+  const command = configuredCodexCommand(options, dependencies);
+  try {
+    await (dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime)(command);
+  } catch (error) {
+    return { started: false, reason: error?.code ?? 'runtime_incomplete' };
+  }
   const lock = dependencies.processLock ?? new SupervisorProcessLock(dataDir);
   const existing = await lock.inspect();
   if (existing?.alive) {
@@ -391,7 +397,6 @@ export async function ensureCommand(options = {}, dependencies = {}) {
       ready: Boolean(ready),
     };
   }
-  const command = configuredCodexCommand(options, dependencies);
   const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
   try {
     await daemon.inspect();
@@ -512,7 +517,13 @@ export async function doctorCommand(options = {}, dependencies = {}) {
   }, 'Approve the Hark installation in the browser.');
   const command = configuredCodexCommand(options, dependencies);
   const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
-  const daemonStatus = await check('codex_runtime', () => daemon.inspect(),
+  let runtimeStatus = null;
+  const daemonStatus = await check('codex_runtime', async () => {
+    runtimeStatus = await (
+      dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime
+    )(command);
+    return daemon.inspect();
+  },
     'Re-run Hark setup to restore the pinned Codex runtime.');
 
   let appServer = null;
@@ -772,6 +783,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
       runtimeId: credentials.installation.runtimeId,
     } : null,
     daemon: daemonStatus,
+    runtime: runtimeStatus,
     clockSource,
     supervisor: supervisorReady,
     checks,
@@ -839,6 +851,7 @@ async function main(argv) {
       `Codex: ${result.daemon?.appServerVersion ?? 'unavailable'}`,
       `Daemon: ${result.daemon?.backend ?? 'unavailable'}`,
       `Managed artifact: ${result.daemon?.managedCodexSha256 ?? 'unavailable'}`,
+      `Code-mode host: ${result.runtime?.codeModeHostSha256 ?? 'unavailable'}`,
       `Clock source: ${result.clockSource ?? 'unavailable'}`,
       `Hark installation: ${result.connected ? 'connected' : 'not connected'}`,
       ...result.checks.filter((check) => !check.ok).map(

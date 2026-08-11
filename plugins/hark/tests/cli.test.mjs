@@ -12,6 +12,7 @@ import {
   doctorCommand,
   ensureCommand,
   formatDeviceVerification,
+  onboardCommand,
   parseArgs,
   wait,
 } from '../cli/hark-codex.mjs';
@@ -50,7 +51,14 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
   const calls = [];
   const verified = [];
   const status = await bootstrapDaemonCommand({ codex: '/opt/codex-0.147.0' }, {
-    verifyFileSha256: async (...args) => { verified.push(args); },
+    verifyPinnedCodexRuntime: async (command) => {
+      verified.push(command);
+      return {
+        path: command,
+        codeModeHostPath: '/opt/codex-code-mode-host',
+        codeModeHostSha256: 'host-sha256',
+      };
+    },
     runProcess: async (command, args) => {
       calls.push([command, args]);
       return args[0] === '--version'
@@ -59,7 +67,7 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
     },
     daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
   });
-  assert.equal(verified[0][0], '/opt/codex-0.147.0');
+  assert.deepEqual(verified, ['/opt/codex-0.147.0']);
   assert.deepEqual(calls, [
     ['/opt/codex-0.147.0', ['--version']],
     ['/opt/codex-0.147.0', ['app-server', 'daemon', 'enable-remote-control']],
@@ -67,13 +75,41 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
   ]);
   assert.equal(status.appServerVersion, '0.147.0');
   assert.equal(status.harkCodexPath, '/opt/codex-0.147.0');
+  assert.equal(status.codeModeHostPath, '/opt/codex-code-mode-host');
+  assert.equal(status.codeModeHostSha256, 'host-sha256');
+});
+
+test('setup performs no Codex or daemon command when the sibling host fails verification', async () => {
+  const calls = [];
+  await assert.rejects(bootstrapDaemonCommand({ codex: '/opt/codex-0.147.0' }, {
+    verifyPinnedCodexRuntime: async () => {
+      const error = new Error('Pinned Codex code-mode host is missing');
+      error.code = 'CODE_MODE_HOST_MISSING';
+      throw error;
+    },
+    runProcess: async (...args) => {
+      calls.push(args);
+      return { stdout: '', stderr: '' };
+    },
+    daemonTransport: {
+      async inspect() {
+        calls.push(['daemon.inspect']);
+        return {};
+      },
+    },
+  }), (error) => error?.code === 'CODE_MODE_HOST_MISSING');
+  assert.deepEqual(calls, []);
 });
 
 test('setup refuses a version mismatch before daemon mutation', async () => {
   const calls = [];
   await assert.rejects(
     bootstrapDaemonCommand({ codex: '/usr/bin/codex' }, {
-      verifyFileSha256: async () => undefined,
+      verifyPinnedCodexRuntime: async (command) => ({
+        path: command,
+        codeModeHostPath: '/usr/bin/codex-code-mode-host',
+        codeModeHostSha256: 'host-sha256',
+      }),
       runProcess: async (command, args) => {
         calls.push([command, args]);
         return { stdout: 'codex-cli 0.146.1\n', stderr: '' };
@@ -90,8 +126,16 @@ test('setup installs and reuses the managed pinned runtime without launching an 
     codexHome: '/tmp/hark-codex-home',
     installPinnedCodexRuntime: async ({ codexHome }) => {
       assert.equal(codexHome, '/tmp/hark-codex-home');
-      return { path: '/tmp/hark-codex-home/packages/standalone/current/codex' };
+      return {
+        path: '/tmp/hark-codex-home/packages/standalone/current/codex',
+        codeModeHostPath: '/tmp/hark-codex-home/packages/standalone/current/codex-code-mode-host',
+      };
     },
+    verifyPinnedCodexRuntime: async (command) => ({
+      path: command,
+      codeModeHostPath: '/tmp/hark-codex-home/packages/standalone/current/codex-code-mode-host',
+      codeModeHostSha256: 'host-sha256',
+    }),
     runProcess: async (command, args) => {
       calls.push([command, args]);
       return args[0] === '--version'
@@ -168,16 +212,46 @@ test('constructs the supervisor only when credentials match the private runtime 
   const appServerClient = { on() {}, off() {} };
   const serviceClient = {};
   const runtime = await createSupervisorRuntime({}, {
-    journal, credentialsStore, appServerClient, serviceClient,
+    journal,
+    credentialsStore,
+    appServerClient,
+    serviceClient,
+    verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
   });
   assert.equal(runtime.credentials.installation.runtimeId, 'runtime-1');
   assert.equal(runtime.supervisor.credentialsStore, credentialsStore);
 
   await journal.update((state) => { state.runtimeId = 'runtime-2'; return state; });
   await assert.rejects(
-    createSupervisorRuntime({}, { journal, credentialsStore, appServerClient, serviceClient }),
+    createSupervisorRuntime({}, {
+      journal,
+      credentialsStore,
+      appServerClient,
+      serviceClient,
+      verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
+    }),
     /installation_runtime_mismatch/,
   );
+});
+
+test('refuses supervisor construction when the pinned runtime tuple is incomplete', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-cli-'));
+  const journal = new HarkJournal(directory);
+  const credentialsStore = new HarkCredentialsStore(directory);
+  await journal.ensureRuntimeId(() => 'runtime-1');
+  await credentialsStore.save({
+    apiBaseUrl: 'https://api.example.test', accessToken: 'hki_secret',
+    installation: { id: 'installation-1', protocol: 'codex', runtimeId: 'runtime-1' },
+  });
+  await assert.rejects(createSupervisorRuntime({}, {
+    journal,
+    credentialsStore,
+    verifyPinnedCodexRuntime: async () => {
+      const error = new Error('Pinned Codex code-mode host is missing');
+      error.code = 'CODE_MODE_HOST_MISSING';
+      throw error;
+    },
+  }), (error) => error?.code === 'CODE_MODE_HOST_MISSING');
 });
 
 test('ensure is a no-op before connection and starts one detached supervisor when ready', async () => {
@@ -195,6 +269,7 @@ test('ensure is a no-op before connection and starts one detached supervisor whe
   const result = await ensureCommand({ codex: '/opt/codex-0.147.0' }, {
     dataDir: directory,
     credentialsStore,
+    verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
     processLock: { inspect: async () => null },
     daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
     waitForSupervisorReady: async () => ({ pid: 1234 }),
@@ -209,6 +284,66 @@ test('ensure is a no-op before connection and starts one detached supervisor whe
   assert.deepEqual(calls[0].args.slice(-3), ['run', '--codex', '/opt/codex-0.147.0']);
   assert.equal(calls[0].options.detached, true);
   assert.equal(calls[0].options.env.HARK_DATA_DIR, directory);
+  assert.equal(logsClosed, true);
+});
+
+test('ensure checks the full runtime tuple before accepting an existing supervisor', async () => {
+  const credentialsStore = {
+    async read() {
+      return {
+        apiBaseUrl: 'https://api.example.test', accessToken: 'hki_secret',
+        installation: { id: 'installation-1', protocol: 'codex', runtimeId: 'runtime-1' },
+      };
+    },
+  };
+  let lockInspections = 0;
+  const result = await ensureCommand({ codex: '/opt/codex-0.147.0' }, {
+    credentialsStore,
+    verifyPinnedCodexRuntime: async () => {
+      const error = new Error('Pinned Codex code-mode host is missing');
+      error.code = 'CODE_MODE_HOST_MISSING';
+      throw error;
+    },
+    processLock: {
+      async inspect() {
+        lockInspections += 1;
+        return { alive: true, pid: 1234 };
+      },
+    },
+  });
+  assert.deepEqual(result, { started: false, reason: 'CODE_MODE_HOST_MISSING' });
+  assert.equal(lockInspections, 0);
+});
+
+test('onboard dispatches the detached setup repair for an already-connected incomplete runtime', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-cli-'));
+  const credentialsStore = new HarkCredentialsStore(directory);
+  await credentialsStore.save({
+    apiBaseUrl: 'https://api.example.test', accessToken: 'hki_secret',
+    installation: { id: 'installation-1', protocol: 'codex', runtimeId: 'runtime-1' },
+  });
+  const spawned = [];
+  let logsClosed = false;
+  const result = await onboardCommand({}, {
+    dataDir: directory,
+    credentialsStore,
+    verifyPinnedCodexRuntime: async () => {
+      const error = new Error('Pinned Codex code-mode host is missing');
+      error.code = 'CODE_MODE_HOST_MISSING';
+      throw error;
+    },
+    onboardingLock: { inspect: async () => null },
+    logs: { stdout: 7, stderr: 8, close: () => { logsClosed = true; } },
+    spawnImpl: (command, args, options) => {
+      spawned.push({ command, args, options });
+      return { pid: 4321, unref() {} };
+    },
+  });
+  assert.deepEqual(result, { setupStarted: true, pid: 4321 });
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0].command, process.execPath);
+  assert.equal(spawned[0].args.at(-1), 'setup');
+  assert.equal(spawned[0].options.detached, true);
   assert.equal(logsClosed, true);
 });
 
@@ -280,6 +415,14 @@ function doctorFixture(overrides = {}) {
     appServerVersion: '0.147.0',
     managedCodexSha256: 'cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40',
   };
+  const runtime = {
+    status: 'already_installed',
+    path: '/opt/codex-0.147.0',
+    version: '0.147.0',
+    sha256: daemon.managedCodexSha256,
+    codeModeHostPath: '/opt/codex-code-mode-host',
+    codeModeHostSha256: '00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6',
+  };
   const config = overrides.config ?? {
     features: {
       current_time_reminder: { clock_source: overrides.clockSource ?? 'system' },
@@ -301,7 +444,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.2' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.3' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -314,6 +457,7 @@ function doctorFixture(overrides = {}) {
   return {
     state,
     daemon,
+    runtime,
     dependencies: {
       platform: 'linux',
       arch: 'x64',
@@ -321,6 +465,8 @@ function doctorFixture(overrides = {}) {
       cwd: '/workspace/hark',
       pluginRoot: TEST_PLUGIN_ROOT,
       credentialsStore: { read: async () => credentials },
+      verifyPinnedCodexRuntime: overrides.verifyPinnedCodexRuntime
+        ?? (async () => runtime),
       daemonTransport: { inspect: async () => daemon },
       appServerClient,
       serviceClient: {
@@ -341,7 +487,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.2', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.3', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -361,6 +507,7 @@ test('doctor certifies the exact held-call hooks and effective MCP config', asyn
   assert.equal(result.ok, true);
   assert.equal(result.clockSource, 'system');
   assert.equal(result.daemon.managedCodexSha256, fixture.daemon.managedCodexSha256);
+  assert.deepEqual(result.runtime, fixture.runtime);
   assert.equal(result.checks.length, 11);
   assert.deepEqual(result.checks.find((check) => check.id === 'hooks').detail, [
     'PostToolUse', 'PreToolUse', 'SessionStart', 'UserPromptSubmit',
@@ -371,6 +518,28 @@ test('doctor certifies the exact held-call hooks and effective MCP config', asyn
   );
   assert.equal(JSON.stringify(result).includes('hki_secret'), false);
   assert.equal(fixture.state.closed, true);
+});
+
+test('doctor fails before App Server work when the code-mode host is unavailable', async () => {
+  const fixture = doctorFixture({
+    verifyPinnedCodexRuntime: async () => {
+      const error = new Error('Pinned Codex code-mode host is missing');
+      error.code = 'CODE_MODE_HOST_MISSING';
+      throw error;
+    },
+  });
+  const result = await doctorCommand({}, fixture.dependencies);
+  assert.equal(result.ok, false);
+  assert.equal(result.runtime, null);
+  assert.equal(
+    result.checks.find((check) => check.id === 'codex_runtime').error,
+    'CODE_MODE_HOST_MISSING',
+  );
+  assert.equal(
+    result.checks.find((check) => check.id === 'app_server').error,
+    'codex_runtime_unavailable',
+  );
+  assert.equal(fixture.state.closed, false);
 });
 
 test('doctor refuses external current-time delivery before wake execution', async () => {
@@ -633,7 +802,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.2', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.3', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);

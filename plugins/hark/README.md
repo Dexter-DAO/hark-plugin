@@ -17,17 +17,21 @@ are never model inputs. The parent package includes the Codex adapter.
 Add this repository as a Codex plugin marketplace and install **Hark**:
 
 ```bash
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.2
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.3
 codex plugin add hark@hark
 ```
 
-Connect before relying on any background hook. Keep the bundled
-`hark-codex connect --no-open` command in the foreground from the installed
-plugin root:
+Connect and install the pinned runtime before relying on any background hook.
+Keep the bundled `hark-codex setup --no-open` command in the foreground from
+the installed plugin root:
 
 ```bash
-node ./hark/cli/hark-codex.mjs connect --no-open
+node ./hark/cli/hark-codex.mjs setup --no-open
 ```
+
+Hark setup pins and verifies both the Codex 0.147 executable and its required
+`codex-code-mode-host` sibling. Existing installations missing only the host
+are repaired without replacing the already-verified Codex executable.
 
 The command visibly prints both fields needed by a headless Linux install:
 
@@ -38,8 +42,8 @@ userCode: ABCD-EFGH
 
 Open `verificationUriComplete` in any browser, verify `userCode`, approve the
 named installation, and wait for the foreground command to report success. The
-`--no-open` form never depends on `xdg-open`. `SessionStart` only ensures an
-already-connected supervisor is running; it is not the approval ceremony.
+`--no-open` form never depends on `xdg-open`. `SessionStart` can repair and
+ensure an already-connected runtime; it is not the approval ceremony.
 
 In the first Codex session, review and trust Hark's four bundled hooks
 (`SessionStart`, `PreToolUse`, `PostToolUse`, and `UserPromptSubmit`) once. Hark

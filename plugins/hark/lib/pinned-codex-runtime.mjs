@@ -33,6 +33,49 @@ export const PINNED_CODEX_RUNTIME = Object.freeze({
   archiveSha256: '0246e2e773834e07f0fb5249ed6ebad12e4591e608f8c7bb97dd6a9690544c36',
   executableSha256: 'cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40',
   managedRelativePath: join('packages', 'standalone', 'current', 'codex'),
+  codeModeHostArchiveFilename: 'codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz',
+  codeModeHostExecutableFilename: 'codex-code-mode-host-x86_64-unknown-linux-musl',
+  codeModeHostAssetUrl: 'https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz',
+  codeModeHostArchiveSha256: '0146adfaac8363ec9fcdb5895f7624db5b2e8617a283887938b7fb97a1dd4356',
+  codeModeHostExecutableSha256: '00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6',
+  managedCodeModeHostRelativePath: join(
+    'packages',
+    'standalone',
+    'current',
+    'codex-code-mode-host',
+  ),
+});
+
+const CODEX_ARTIFACT = Object.freeze({
+  label: 'Codex executable',
+  archiveFilename: PINNED_CODEX_RUNTIME.archiveFilename,
+  executableFilename: PINNED_CODEX_RUNTIME.executableFilename,
+  assetUrl: PINNED_CODEX_RUNTIME.assetUrl,
+  archiveSha256: PINNED_CODEX_RUNTIME.archiveSha256,
+  executableSha256: PINNED_CODEX_RUNTIME.executableSha256,
+  archiveMismatchCode: 'ARCHIVE_SHA256_MISMATCH',
+  executableMismatchCode: 'EXECUTABLE_SHA256_MISMATCH',
+  targetMismatchCode: 'TARGET_MISMATCH',
+  targetUnsafeCode: 'TARGET_UNSAFE',
+  targetNotExecutableCode: 'TARGET_NOT_EXECUTABLE',
+  targetChangedCode: 'TARGET_CHANGED_DURING_VERIFICATION',
+  targetMissingCode: 'TARGET_MISSING',
+});
+
+const CODE_MODE_HOST_ARTIFACT = Object.freeze({
+  label: 'Codex code-mode host',
+  archiveFilename: PINNED_CODEX_RUNTIME.codeModeHostArchiveFilename,
+  executableFilename: PINNED_CODEX_RUNTIME.codeModeHostExecutableFilename,
+  assetUrl: PINNED_CODEX_RUNTIME.codeModeHostAssetUrl,
+  archiveSha256: PINNED_CODEX_RUNTIME.codeModeHostArchiveSha256,
+  executableSha256: PINNED_CODEX_RUNTIME.codeModeHostExecutableSha256,
+  archiveMismatchCode: 'CODE_MODE_HOST_ARCHIVE_SHA256_MISMATCH',
+  executableMismatchCode: 'CODE_MODE_HOST_EXECUTABLE_SHA256_MISMATCH',
+  targetMismatchCode: 'CODE_MODE_HOST_TARGET_MISMATCH',
+  targetUnsafeCode: 'CODE_MODE_HOST_TARGET_UNSAFE',
+  targetNotExecutableCode: 'CODE_MODE_HOST_NOT_EXECUTABLE',
+  targetChangedCode: 'CODE_MODE_HOST_CHANGED_DURING_VERIFICATION',
+  targetMissingCode: 'CODE_MODE_HOST_MISSING',
 });
 
 export class PinnedCodexRuntimeError extends Error {
@@ -103,6 +146,20 @@ export function managedCodexPath(codexHome) {
     requireAbsoluteDirectory(codexHome, 'CODEX_HOME'),
     PINNED_CODEX_RUNTIME.managedRelativePath,
   );
+}
+
+export function managedCodexCodeModeHostPath(codexHome) {
+  return join(
+    requireAbsoluteDirectory(codexHome, 'CODEX_HOME'),
+    PINNED_CODEX_RUNTIME.managedCodeModeHostRelativePath,
+  );
+}
+
+export function siblingCodexCodeModeHostPath(codexPath) {
+  if (typeof codexPath !== 'string' || codexPath.length === 0 || !isAbsolute(codexPath)) {
+    fail('CODEX_EXECUTABLE_PATH_INVALID', 'Codex executable path must be absolute', { codexPath });
+  }
+  return join(dirname(codexPath), 'codex-code-mode-host');
 }
 
 export async function sha256File(
@@ -270,7 +327,7 @@ async function defaultRunProcess(command, args, {
   });
 }
 
-async function inspectExistingTarget(targetPath, {
+async function inspectExistingTarget(targetPath, artifact, {
   lstatImpl,
   verifyFileImpl,
   hashFileImpl,
@@ -288,15 +345,22 @@ async function inspectExistingTarget(targetPath, {
     );
   }
   if (!stat.isFile() || stat.isSymbolicLink?.()) {
-    fail('TARGET_UNSAFE', 'Managed Codex runtime path is not a regular file', {
+    fail(artifact.targetUnsafeCode, `Managed ${artifact.label} path is not a regular file`, {
       targetPath,
     });
   }
+  if ((stat.mode & 0o111) === 0) {
+    fail(artifact.targetNotExecutableCode, `Managed ${artifact.label} is not executable`, {
+      targetPath,
+      mode: stat.mode & 0o777,
+    });
+  }
+  const identity = `${String(stat.dev)}:${String(stat.ino)}:${String(stat.size)}`;
   try {
-    await verifyFileImpl(targetPath, PINNED_CODEX_RUNTIME.executableSha256, {
+    await verifyFileImpl(targetPath, artifact.executableSha256, {
       hashFileImpl,
-      mismatchCode: 'TARGET_MISMATCH',
-      label: 'Existing managed Codex executable',
+      mismatchCode: artifact.targetMismatchCode,
+      label: `Existing managed ${artifact.label}`,
     });
   } catch (error) {
     if (error instanceof PinnedCodexRuntimeError) throw error;
@@ -307,17 +371,224 @@ async function inspectExistingTarget(targetPath, {
       { cause: error },
     );
   }
+  let verifiedStat;
+  try {
+    verifiedStat = await lstatImpl(targetPath);
+  } catch (error) {
+    fail(
+      artifact.targetChangedCode,
+      `Managed ${artifact.label} changed during verification`,
+      { targetPath },
+      { cause: error },
+    );
+  }
+  const verifiedIdentity = `${String(verifiedStat.dev)}:${String(verifiedStat.ino)}:${String(verifiedStat.size)}`;
+  if (
+    !verifiedStat.isFile()
+    || verifiedStat.isSymbolicLink?.()
+    || (verifiedStat.mode & 0o111) === 0
+    || verifiedIdentity !== identity
+  ) {
+    fail(artifact.targetChangedCode, `Managed ${artifact.label} changed during verification`, {
+      targetPath,
+    });
+  }
   return {
     status: 'already_installed',
     path: targetPath,
     version: PINNED_CODEX_RUNTIME.version,
-    sha256: PINNED_CODEX_RUNTIME.executableSha256,
+    sha256: artifact.executableSha256,
   };
 }
 
 function resolveCodexHome({ codexHome, env, homedirImpl }) {
   const configured = codexHome ?? env.CODEX_HOME ?? join(homedirImpl(), '.codex');
   return requireAbsoluteDirectory(configured, 'CODEX_HOME');
+}
+
+async function installMissingArtifact({
+  artifact,
+  targetPath,
+  standaloneDirectory,
+  downloadFileImpl = streamDownloadToFile,
+  runProcessImpl = defaultRunProcess,
+  verifyFileImpl = verifyFileSha256,
+  hashFileImpl = sha256File,
+  mkdirImpl = nodeMkdirPromise,
+  mkdtempImpl = nodeMkdtempPromise,
+  chmodImpl = nodeChmodPromise,
+  lstatImpl = nodeLstatPromise,
+  readdirImpl = nodeReaddirPromise,
+  linkImpl = nodeLinkPromise,
+  rmImpl = nodeRmPromise,
+} = {}) {
+  const targetDirectory = dirname(targetPath);
+
+  let tempDirectory;
+  let outcome;
+  let primaryError;
+  try {
+    tempDirectory = await mkdtempImpl(join(standaloneDirectory, '.hark-codex-install-'));
+    await chmodImpl(tempDirectory, 0o700);
+    const archivePath = join(tempDirectory, artifact.archiveFilename);
+    const extractionDirectory = join(tempDirectory, 'extracted');
+    await mkdirImpl(extractionDirectory, { mode: 0o700 });
+
+    await downloadFileImpl(artifact.assetUrl, archivePath);
+    await verifyFileImpl(archivePath, artifact.archiveSha256, {
+      hashFileImpl,
+      mismatchCode: artifact.archiveMismatchCode,
+      label: `${artifact.label} release archive`,
+    });
+
+    let extractionResult;
+    try {
+      extractionResult = await runProcessImpl('tar', [
+        '-xzf',
+        archivePath,
+        '--directory',
+        extractionDirectory,
+        '--no-same-owner',
+        '--no-same-permissions',
+        '--anchored',
+        '--',
+        artifact.executableFilename,
+      ], { cwd: tempDirectory });
+    } catch (error) {
+      if (error instanceof PinnedCodexRuntimeError) throw error;
+      fail(
+        'EXTRACTION_FAILED',
+        'Could not extract the pinned Codex release archive',
+        undefined,
+        { cause: error },
+      );
+    }
+    if (!extractionResult || extractionResult.code !== 0) {
+      fail('EXTRACTION_FAILED', 'Pinned Codex release archive extraction failed', {
+        code: extractionResult?.code ?? null,
+        signal: extractionResult?.signal ?? null,
+        stderr: String(extractionResult?.stderr ?? ''),
+      });
+    }
+
+    const extractedEntries = await readdirImpl(extractionDirectory);
+    if (
+      extractedEntries.length !== 1
+      || extractedEntries[0] !== artifact.executableFilename
+    ) {
+      fail('ARCHIVE_CONTENT_INVALID', `${artifact.label} archive did not extract exactly one expected file`, {
+        entries: [...extractedEntries].sort(),
+      });
+    }
+
+    const extractedPath = join(
+      extractionDirectory,
+      artifact.executableFilename,
+    );
+    const extractedStat = await lstatImpl(extractedPath);
+    if (!extractedStat.isFile() || extractedStat.isSymbolicLink?.()) {
+      fail('ARCHIVE_CONTENT_INVALID', `Extracted ${artifact.label} is not a regular file`, {
+        extractedPath,
+      });
+    }
+    await verifyFileImpl(extractedPath, artifact.executableSha256, {
+      hashFileImpl,
+      mismatchCode: artifact.executableMismatchCode,
+      label: `Extracted ${artifact.label}`,
+    });
+    await chmodImpl(extractedPath, 0o700);
+    await mkdirImpl(targetDirectory, { recursive: true, mode: 0o700 });
+
+    try {
+      await linkImpl(extractedPath, targetPath);
+    } catch (error) {
+      if (!isAlreadyExists(error)) {
+        fail(
+          'INSTALL_FAILED',
+          `Could not atomically install the pinned ${artifact.label}`,
+          { targetPath },
+          { cause: error },
+        );
+      }
+      const raced = await inspectExistingTarget(targetPath, artifact, {
+        lstatImpl,
+        verifyFileImpl,
+        hashFileImpl,
+      });
+      if (!raced) {
+        fail('INSTALL_RACE_LOST', 'Managed Codex runtime disappeared during installation', {
+          targetPath,
+        });
+      }
+      outcome = raced;
+    }
+
+    outcome ??= {
+      status: 'installed',
+      path: targetPath,
+      version: PINNED_CODEX_RUNTIME.version,
+      sha256: artifact.executableSha256,
+    };
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    if (tempDirectory) {
+      try {
+        await rmImpl(tempDirectory, { recursive: true, force: true });
+      } catch (cleanupError) {
+        if (!primaryError) {
+          primaryError = new PinnedCodexRuntimeError(
+            'TEMP_CLEANUP_FAILED',
+            `Pinned ${artifact.label} installed, but its exact temporary directory could not be removed`,
+            { tempDirectory, targetPath },
+            { cause: cleanupError },
+          );
+        }
+      }
+    }
+  }
+  if (primaryError) throw primaryError;
+  return outcome;
+}
+
+function combinedInstallOutcome(codex, codeModeHost) {
+  return {
+    status: codex.status === 'already_installed' && codeModeHost.status === 'already_installed'
+      ? 'already_installed'
+      : 'installed',
+    path: codex.path,
+    version: PINNED_CODEX_RUNTIME.version,
+    sha256: codex.sha256,
+    codeModeHostPath: codeModeHost.path,
+    codeModeHostSha256: codeModeHost.sha256,
+  };
+}
+
+export async function verifyPinnedCodexRuntime(codexPath, {
+  verifyFileImpl = verifyFileSha256,
+  hashFileImpl = sha256File,
+  lstatImpl = nodeLstatPromise,
+} = {}) {
+  const codeModeHostPath = siblingCodexCodeModeHostPath(codexPath);
+  const codeModeHost = await inspectExistingTarget(
+    codeModeHostPath,
+    CODE_MODE_HOST_ARTIFACT,
+    { lstatImpl, verifyFileImpl, hashFileImpl },
+  );
+  if (!codeModeHost) {
+    fail(CODE_MODE_HOST_ARTIFACT.targetMissingCode, 'Pinned Codex code-mode host is missing', {
+      codeModeHostPath,
+    });
+  }
+  const codex = await inspectExistingTarget(codexPath, CODEX_ARTIFACT, {
+    lstatImpl,
+    verifyFileImpl,
+    hashFileImpl,
+  });
+  if (!codex) {
+    fail(CODEX_ARTIFACT.targetMissingCode, 'Pinned Codex executable is missing', { codexPath });
+  }
+  return combinedInstallOutcome(codex, codeModeHost);
 }
 
 export async function installPinnedCodexRuntime({
@@ -348,141 +619,57 @@ export async function installPinnedCodexRuntime({
   }
 
   const resolvedCodexHome = resolveCodexHome({ codexHome, env, homedirImpl });
-  const targetPath = managedCodexPath(resolvedCodexHome);
-  const existing = await inspectExistingTarget(targetPath, {
-    lstatImpl,
-    verifyFileImpl,
-    hashFileImpl,
-  });
-  if (existing) return existing;
+  const codexPath = managedCodexPath(resolvedCodexHome);
+  const codeModeHostPath = managedCodexCodeModeHostPath(resolvedCodexHome);
+  const inspectionDependencies = { lstatImpl, verifyFileImpl, hashFileImpl };
+  const existingCodex = await inspectExistingTarget(
+    codexPath,
+    CODEX_ARTIFACT,
+    inspectionDependencies,
+  );
+  const existingCodeModeHost = await inspectExistingTarget(
+    codeModeHostPath,
+    CODE_MODE_HOST_ARTIFACT,
+    inspectionDependencies,
+  );
+  if (existingCodex && existingCodeModeHost) {
+    return combinedInstallOutcome(existingCodex, existingCodeModeHost);
+  }
 
   const standaloneDirectory = join(resolvedCodexHome, 'packages', 'standalone');
-  const targetDirectory = dirname(targetPath);
   await mkdirImpl(standaloneDirectory, { recursive: true, mode: 0o700 });
+  const installDependencies = {
+    standaloneDirectory,
+    downloadFileImpl,
+    runProcessImpl,
+    verifyFileImpl,
+    hashFileImpl,
+    mkdirImpl,
+    mkdtempImpl,
+    chmodImpl,
+    lstatImpl,
+    readdirImpl,
+    linkImpl,
+    rmImpl,
+  };
 
-  let tempDirectory;
-  let outcome;
-  let primaryError;
-  try {
-    tempDirectory = await mkdtempImpl(join(standaloneDirectory, '.hark-codex-install-'));
-    await chmodImpl(tempDirectory, 0o700);
-    const archivePath = join(tempDirectory, PINNED_CODEX_RUNTIME.archiveFilename);
-    const extractionDirectory = join(tempDirectory, 'extracted');
-    await mkdirImpl(extractionDirectory, { mode: 0o700 });
-
-    await downloadFileImpl(PINNED_CODEX_RUNTIME.assetUrl, archivePath);
-    await verifyFileImpl(archivePath, PINNED_CODEX_RUNTIME.archiveSha256, {
-      hashFileImpl,
-      mismatchCode: 'ARCHIVE_SHA256_MISMATCH',
-      label: 'Codex release archive',
-    });
-
-    let extractionResult;
-    try {
-      extractionResult = await runProcessImpl('tar', [
-        '-xzf',
-        archivePath,
-        '--directory',
-        extractionDirectory,
-        '--no-same-owner',
-        '--no-same-permissions',
-        '--anchored',
-        '--',
-        PINNED_CODEX_RUNTIME.executableFilename,
-      ], { cwd: tempDirectory });
-    } catch (error) {
-      if (error instanceof PinnedCodexRuntimeError) throw error;
-      fail(
-        'EXTRACTION_FAILED',
-        'Could not extract the pinned Codex release archive',
-        undefined,
-        { cause: error },
-      );
-    }
-    if (!extractionResult || extractionResult.code !== 0) {
-      fail('EXTRACTION_FAILED', 'Pinned Codex release archive extraction failed', {
-        code: extractionResult?.code ?? null,
-        signal: extractionResult?.signal ?? null,
-        stderr: String(extractionResult?.stderr ?? ''),
-      });
-    }
-
-    const extractedEntries = await readdirImpl(extractionDirectory);
-    if (
-      extractedEntries.length !== 1
-      || extractedEntries[0] !== PINNED_CODEX_RUNTIME.executableFilename
-    ) {
-      fail('ARCHIVE_CONTENT_INVALID', 'Codex release archive did not extract exactly one expected file', {
-        entries: [...extractedEntries].sort(),
-      });
-    }
-
-    const extractedPath = join(
-      extractionDirectory,
-      PINNED_CODEX_RUNTIME.executableFilename,
-    );
-    const extractedStat = await lstatImpl(extractedPath);
-    if (!extractedStat.isFile() || extractedStat.isSymbolicLink?.()) {
-      fail('ARCHIVE_CONTENT_INVALID', 'Extracted Codex executable is not a regular file', {
-        extractedPath,
-      });
-    }
-    await verifyFileImpl(extractedPath, PINNED_CODEX_RUNTIME.executableSha256, {
-      hashFileImpl,
-      mismatchCode: 'EXECUTABLE_SHA256_MISMATCH',
-      label: 'Extracted Codex executable',
-    });
-    await chmodImpl(extractedPath, 0o700);
-    await mkdirImpl(targetDirectory, { recursive: true, mode: 0o700 });
-
-    try {
-      await linkImpl(extractedPath, targetPath);
-    } catch (error) {
-      if (!isAlreadyExists(error)) {
-        fail(
-          'INSTALL_FAILED',
-          'Could not atomically install the pinned Codex executable',
-          { targetPath },
-          { cause: error },
-        );
-      }
-      const raced = await inspectExistingTarget(targetPath, {
-        lstatImpl,
-        verifyFileImpl,
-        hashFileImpl,
-      });
-      if (!raced) {
-        fail('INSTALL_RACE_LOST', 'Managed Codex runtime disappeared during installation', {
-          targetPath,
-        });
-      }
-      outcome = raced;
-    }
-
-    outcome ??= {
-      status: 'installed',
-      path: targetPath,
-      version: PINNED_CODEX_RUNTIME.version,
-      sha256: PINNED_CODEX_RUNTIME.executableSha256,
-    };
-  } catch (error) {
-    primaryError = error;
-  } finally {
-    if (tempDirectory) {
-      try {
-        await rmImpl(tempDirectory, { recursive: true, force: true });
-      } catch (cleanupError) {
-        if (!primaryError) {
-          primaryError = new PinnedCodexRuntimeError(
-            'TEMP_CLEANUP_FAILED',
-            'Pinned Codex runtime installed, but its exact temporary directory could not be removed',
-            { tempDirectory, targetPath },
-            { cause: cleanupError },
-          );
-        }
-      }
-    }
-  }
-  if (primaryError) throw primaryError;
-  return outcome;
+  // Install the tool host first. The Codex executable is the final readiness
+  // latch on a fresh install; an interrupted run is safely repairable.
+  const codeModeHost = existingCodeModeHost ?? await installMissingArtifact({
+    ...installDependencies,
+    artifact: CODE_MODE_HOST_ARTIFACT,
+    targetPath: codeModeHostPath,
+  });
+  const codex = existingCodex ?? await installMissingArtifact({
+    ...installDependencies,
+    artifact: CODEX_ARTIFACT,
+    targetPath: codexPath,
+  });
+  const verified = await verifyPinnedCodexRuntime(codexPath, inspectionDependencies);
+  return {
+    ...verified,
+    status: codex.status === 'installed' || codeModeHost.status === 'installed'
+      ? 'installed'
+      : verified.status,
+  };
 }
