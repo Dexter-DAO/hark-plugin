@@ -1,0 +1,30 @@
+{
+  "name": "hark",
+  "version": "0.1.1",
+  "description": "Durable external waits and exact-task continuation for AI agents.",
+  "author": {
+    "name": "Dexter",
+    "url": "https://dexter.cash"
+  },
+  "homepage": "https://hark.sh",
+  "repository": "https://github.com/Dexter-DAO/hark",
+  "license": "LicenseRef-Proprietary",
+  "keywords": ["agents", "durable-waits", "continuations", "hark"],
+  "skills": "./hark/skills/",
+  "interface": {
+    "displayName": "Hark",
+    "shortDescription": "Wait for a real event, then continue the same Codex task.",
+    "longDescription": "Hold one Hark tool call with zero model inference until an authenticated external event returns to the same originating Codex turn. Durable recovery stays automatic and out of the way.",
+    "developerName": "Dexter",
+    "category": "Productivity",
+    "capabilities": ["External waits", "Exact-task continuation"],
+    "websiteURL": "https://hark.sh",
+    "defaultPrompt": [
+      "Hark me when this external condition becomes true.",
+      "Wait here until the external job completes, then continue this task."
+    ],
+    "brandColor": "#863BFF"
+  },
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json"
+}

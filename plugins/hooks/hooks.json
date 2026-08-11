@@ -1,0 +1,55 @@
+{
+  "description": "Bind one root Hark Await to its exact Codex tool boundary and record its durable return.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hark/cli/hark-codex.mjs\" onboard --json",
+            "timeout": 10,
+            "statusMessage": "Connecting Hark durable waits"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__hark__hark_await",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hark/hooks/ingress.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Binding Hark Await"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__hark__hark_await",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hark/hooks/ingress.mjs\"",
+            "timeout": 40,
+            "statusMessage": "Recording Hark return"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hark/hooks/prompt-guard.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Checking Hark sleep boundary"
+          }
+        ]
+      }
+    ]
+  }
+}

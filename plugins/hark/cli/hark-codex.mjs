@@ -1,0 +1,868 @@
+#!/usr/bin/env node
+
+import { spawn } from 'node:child_process';
+import { mkdir } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  AppServerClient,
+  CODEX_APP_SERVER_COMPATIBILITY,
+} from '../lib/app-server-client.mjs';
+import {
+  CodexDaemonTransport,
+  createCodexDaemonTransportFactory,
+} from '../lib/codex-daemon-transport.mjs';
+import { HarkCredentialsStore } from '../lib/credentials.mjs';
+import { HarkHeldCrashRecovery } from '../lib/held-crash-recovery.mjs';
+import { HarkHookInbox } from '../lib/hook-inbox.mjs';
+import { HarkHeldWaitCertifier } from '../lib/held-wait-certifier.mjs';
+import { defaultHarkDataDir, HarkJournal } from '../lib/journal.mjs';
+import { HarkApiError, HarkServiceClient } from '../lib/service-client.mjs';
+import {
+  installPinnedCodexRuntime,
+  managedCodexPath,
+  PINNED_CODEX_RUNTIME,
+  verifyFileSha256,
+} from '../lib/pinned-codex-runtime.mjs';
+import { HarkCodexSupervisor } from '../lib/supervisor.mjs';
+import { openSupervisorLogs, SupervisorProcessLock } from '../lib/supervisor-process.mjs';
+import { HarkToolWaitProtocol } from '../lib/tool-wait-protocol.mjs';
+import {
+  captureCodexRolloutBoundary,
+  preflightCodexWaitHistory,
+  proveCodexWaitHistory,
+} from '../lib/transcript-proof.mjs';
+
+const HELP = `Hark for Codex
+
+Usage:
+  hark-codex connect [--api-url URL] [--name NAME] [--no-open]
+  hark-codex setup [--api-url URL] [--name NAME] [--no-open] [--codex PATH]
+  hark-codex onboard [--json]
+  hark-codex ensure [--codex PATH] [--json]
+  hark-codex run [--codex PATH]
+  hark-codex doctor [--codex PATH] [--json]
+
+Commands:
+  connect  Run foreground approval; --no-open prints the headless URL and code.
+  setup    Bootstrap the pinned Codex daemon, connect Hark, and start the supervisor.
+  onboard  Complete first-run setup in the background, or keep Hark running.
+  ensure   Start one background supervisor if this runtime is ready.
+  run      Attach the Hark supervisor to the pinned Codex App Server daemon.
+  doctor   Verify credentials and the read-only Codex daemon/App Server gates.
+
+Environment:
+  HARK_API_URL    Hark API base URL (default: https://api.dexter.cash)
+  HARK_ALLOW_INSECURE_LOOPBACK=1  Permit HTTP only for localhost development
+  HARK_CODEX_BIN  Exact Codex 0.147.0 executable
+  HARK_DATA_DIR   Shared private Hark data directory (default: ~/.hark)
+`;
+
+const CODEX_PLUGIN_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  '..',
+);
+
+function certifiedHookContract(pluginRoot) {
+  return Object.freeze({
+    SessionStart: Object.freeze({
+      command: `node "${pluginRoot}/hark/cli/hark-codex.mjs" onboard --json`,
+      timeout: 10,
+      matcher: null,
+    }),
+    PreToolUse: Object.freeze({
+      command: `node "${pluginRoot}/hark/hooks/ingress.mjs"`,
+      timeout: 10,
+      matcher: 'mcp__hark__hark_await',
+    }),
+    PostToolUse: Object.freeze({
+      command: `node "${pluginRoot}/hark/hooks/ingress.mjs"`,
+      timeout: 40,
+      matcher: 'mcp__hark__hark_await',
+    }),
+    UserPromptSubmit: Object.freeze({
+      command: `node "${pluginRoot}/hark/hooks/prompt-guard.mjs"`,
+      timeout: 5,
+      matcher: null,
+    }),
+  });
+}
+
+function parseArgs(argv) {
+  const args = [...argv];
+  const command = args.shift() ?? 'help';
+  const options = {};
+  while (args.length) {
+    const arg = args.shift();
+    if (arg === '--no-open') options.open = false;
+    else if (arg === '--json') options.json = true;
+    else if (['--api-url', '--name', '--codex'].includes(arg)) {
+      const value = args.shift();
+      if (!value) throw new Error(`missing_value:${arg}`);
+      options[arg.slice(2).replaceAll('-', '_')] = value;
+    } else throw new Error(`unknown_argument:${arg}`);
+  }
+  return { command, options };
+}
+
+function wait(ms, signal = undefined) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (operation) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', abort);
+      operation();
+    };
+    const abort = () => {
+      clearTimeout(timer);
+      finish(() => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    };
+    const timer = setTimeout(() => finish(resolve), ms);
+    if (signal?.aborted) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+async function waitForSupervisorReady(lock, timeoutMs = 7_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ready = await lock.inspectReady();
+    if (ready) return ready;
+    const process = await lock.inspect();
+    if (!process) throw new Error('hark_supervisor_exited_before_ready');
+    await wait(50);
+  }
+  throw new Error('hark_supervisor_ready_timeout');
+}
+
+function openUrl(url, spawnImpl = spawn) {
+  const command = process.platform === 'darwin'
+    ? ['open', [url]]
+    : process.platform === 'win32'
+      ? ['cmd.exe', ['/d', '/s', '/c', 'start', '', url]]
+      : ['xdg-open', [url]];
+  try {
+    const child = spawnImpl(command[0], command[1], {
+      stdio: 'ignore',
+      detached: true,
+    });
+    child.unref?.();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatDeviceVerification(value) {
+  const verificationUriComplete = typeof value?.verificationUriComplete === 'string'
+    ? value.verificationUriComplete.trim()
+    : '';
+  const userCode = typeof value?.userCode === 'string' ? value.userCode.trim() : '';
+  if (!verificationUriComplete) throw new Error('verification_uri_complete_required');
+  if (!userCode) throw new Error('user_code_required');
+  return [
+    `verificationUriComplete: ${verificationUriComplete}`,
+    `userCode: ${userCode}`,
+    '',
+  ].join('\n');
+}
+
+export async function connectCommand(options = {}, dependencies = {}) {
+  const journal = dependencies.journal ?? new HarkJournal();
+  const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore();
+  const runtimeId = await journal.ensureRuntimeId(() => cryptoRandomRuntimeId());
+  const existing = await credentialsStore.read();
+  if (existing) {
+    if (existing.installation.runtimeId !== runtimeId) {
+      throw new Error('installation_runtime_mismatch');
+    }
+    return { alreadyConnected: true, installation: existing.installation };
+  }
+  const baseUrl = options.api_url ?? process.env.HARK_API_URL;
+  const unauthenticated = dependencies.serviceClient ?? new HarkServiceClient({ baseUrl });
+  const device = await unauthenticated.createDeviceCode({
+    runtimeId,
+    name: options.name ?? `${os.hostname()} Codex`,
+  });
+  dependencies.onVerification?.({
+    userCode: device.userCode,
+    verificationUri: device.verificationUri,
+    verificationUriComplete: device.verificationUriComplete,
+  });
+  if (options.open !== false) {
+    (dependencies.openUrl ?? openUrl)(device.verificationUriComplete);
+  }
+  const intervalMs = Math.max(1, Number(device.interval) || 3) * 1000;
+  const expiresAt = Date.now() + Math.max(1, Number(device.expiresIn) || 600) * 1000;
+  while (Date.now() < expiresAt) {
+    try {
+      const token = await unauthenticated.exchangeDeviceCode(device.deviceCode);
+      if (token.installation.runtimeId !== runtimeId || token.installation.protocol !== 'codex') {
+        throw new Error('installation_identity_mismatch');
+      }
+      await credentialsStore.save({
+        apiBaseUrl: unauthenticated.baseUrl,
+        accessToken: token.accessToken,
+        installation: token.installation,
+      });
+      return { alreadyConnected: false, installation: token.installation };
+    } catch (error) {
+      if (error instanceof HarkApiError && error.code === 'authorization_pending') {
+        await (dependencies.wait ?? wait)(intervalMs, options.signal);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('device_code_expired');
+}
+
+function cryptoRandomRuntimeId() {
+  return `hkr_${globalThis.crypto.randomUUID()}`;
+}
+
+function codexHome(options = {}, dependencies = {}) {
+  return dependencies.codexHome
+    ?? options.codex_home
+    ?? process.env.CODEX_HOME
+    ?? path.join(os.homedir(), '.codex');
+}
+
+function configuredCodexCommand(options = {}, dependencies = {}) {
+  return options.codex
+    ?? process.env.HARK_CODEX_BIN
+    ?? managedCodexPath(codexHome(options, dependencies));
+}
+
+export async function createSupervisorRuntime(options = {}, dependencies = {}) {
+  const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
+  const journal = dependencies.journal ?? new HarkJournal(dataDir);
+  const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
+  const credentials = await credentialsStore.read();
+  if (!credentials) throw new Error('hark_not_connected');
+  const runtimeId = await journal.ensureRuntimeId(() => credentials.installation.runtimeId);
+  if (runtimeId !== credentials.installation.runtimeId) throw new Error('installation_runtime_mismatch');
+  const command = configuredCodexCommand(options, dependencies);
+  const transportFactory = dependencies.transportFactory
+    ?? createCodexDaemonTransportFactory({ command });
+  const appServerClientFactory = dependencies.appServerClientFactory
+    ?? (dependencies.appServerClient
+      ? () => dependencies.appServerClient
+      : () => new AppServerClient({ command, transportFactory }));
+  const service = dependencies.serviceClient ?? new HarkServiceClient({
+    baseUrl: credentials.apiBaseUrl,
+    accessToken: credentials.accessToken,
+  });
+  const heldWaitProtocol = dependencies.heldWaitProtocol ?? new HarkToolWaitProtocol(dataDir);
+  const heldWaitCertifier = dependencies.heldWaitCertifier ?? new HarkHeldWaitCertifier({
+    protocol: heldWaitProtocol,
+    serviceClient: service,
+    credentialsStore,
+    installation: credentials.installation,
+    runtimeId,
+    logger: dependencies.logger ?? console,
+  });
+  const heldRecovery = dependencies.heldRecovery ?? new HarkHeldCrashRecovery({
+    protocol: heldWaitProtocol,
+    serviceClient: service,
+    runtimeId,
+  });
+  const supervisor = new HarkCodexSupervisor({
+    appServerClientFactory,
+    serviceClient: service,
+    credentialsStore,
+    journal,
+    hookInbox: dependencies.hookInbox ?? new HarkHookInbox(dataDir),
+    transcriptProof: dependencies.transcriptProof ?? {
+      capture: captureCodexRolloutBoundary,
+      preflight: preflightCodexWaitHistory,
+      prove: proveCodexWaitHistory,
+    },
+    heldWaitCertifier,
+    heldRecovery,
+    runtimeId,
+    installation: credentials.installation,
+    logger: dependencies.logger ?? console,
+  });
+  return {
+    supervisor,
+    heldWaitCertifier,
+    heldRecovery,
+    appServerClientFactory,
+    service,
+    journal,
+    credentials,
+  };
+}
+
+export async function runCommand(options = {}, dependencies = {}) {
+  const runtime = await createSupervisorRuntime(options, dependencies);
+  await runtime.supervisor.start();
+  return runtime;
+}
+
+async function runProcess(command, args, dependencies = {}) {
+  const spawnImpl = dependencies.spawnImpl ?? spawn;
+  return new Promise((resolve, reject) => {
+    const child = spawnImpl(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.setEncoding?.('utf8');
+    child.stderr?.setEncoding?.('utf8');
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(`command_failed:${code}:${stderr.trim()}`));
+    });
+  });
+}
+
+export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
+  const explicitCommand = options.codex ?? process.env.HARK_CODEX_BIN ?? null;
+  let command;
+  if (explicitCommand) {
+    command = explicitCommand;
+    await (dependencies.verifyFileSha256 ?? verifyFileSha256)(
+      command,
+      PINNED_CODEX_RUNTIME.executableSha256,
+      {
+        mismatchCode: 'CODEX_EXECUTABLE_SHA256_MISMATCH',
+        label: 'Configured Codex executable',
+      },
+    );
+  } else {
+    const installed = await (
+      dependencies.installPinnedCodexRuntime ?? installPinnedCodexRuntime
+    )({ codexHome: codexHome(options, dependencies) });
+    command = installed.path;
+  }
+  const execute = dependencies.runProcess ?? runProcess;
+  const versionResult = await execute(command, ['--version']);
+  const versionOutput = `${versionResult?.stdout ?? ''}\n${versionResult?.stderr ?? ''}`;
+  const actualVersion = versionOutput.match(/(?:codex-cli\s+)?(\d+\.\d+\.\d+)/)?.[1] ?? null;
+  if (actualVersion !== CODEX_APP_SERVER_COMPATIBILITY.codexVersion) {
+    throw new Error(
+      `codex_version_gate_failed:${actualVersion ?? 'unknown'}:`
+      + CODEX_APP_SERVER_COMPATIBILITY.codexVersion,
+    );
+  }
+  // `bootstrap` launches Codex's detached auto-updater, which would silently
+  // replace the certified runtime. Hark deliberately enables the setting and
+  // starts the daemon through the two non-updating lifecycle commands.
+  await execute(command, ['app-server', 'daemon', 'enable-remote-control']);
+  await execute(command, ['app-server', 'daemon', 'start']);
+  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
+  const inspection = await daemon.inspect();
+  if (inspection.managedCodexPath && inspection.managedCodexPath !== command) {
+    throw new Error('codex_managed_path_mismatch');
+  }
+  return { ...inspection, harkCodexPath: command };
+}
+
+export async function ensureCommand(options = {}, dependencies = {}) {
+  const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
+  const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
+  const credentials = await credentialsStore.read();
+  if (!credentials) return { started: false, reason: 'not_connected' };
+  const lock = dependencies.processLock ?? new SupervisorProcessLock(dataDir);
+  const existing = await lock.inspect();
+  if (existing?.alive) {
+    let ready = typeof lock.inspectReady === 'function' ? await lock.inspectReady() : null;
+    if (!ready && typeof lock.inspectReady === 'function') {
+      try {
+        ready = await (dependencies.waitForSupervisorReady ?? waitForSupervisorReady)(
+          lock,
+          dependencies.readyTimeoutMs ?? 7_000,
+        );
+      } catch {
+        // Report the bounded starting state; the next SessionStart retries.
+      }
+    }
+    return {
+      started: false,
+      reason: ready ? 'already_running' : 'starting',
+      pid: existing.pid,
+      ready: Boolean(ready),
+    };
+  }
+  const command = configuredCodexCommand(options, dependencies);
+  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
+  try {
+    await daemon.inspect();
+  } catch (error) {
+    return { started: false, reason: error?.code ?? 'daemon_not_ready' };
+  }
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  const logs = dependencies.logs ?? openSupervisorLogs(dataDir);
+  const script = fileURLToPath(import.meta.url);
+  const spawnImpl = dependencies.spawnImpl ?? spawn;
+  try {
+    const child = spawnImpl(process.execPath, [script, 'run', '--codex', command], {
+      detached: true,
+      env: { ...process.env, HARK_DATA_DIR: dataDir },
+      stdio: ['ignore', logs.stdout, logs.stderr],
+    });
+    child.unref?.();
+    const ready = await (dependencies.waitForSupervisorReady ?? waitForSupervisorReady)(
+      lock,
+      dependencies.readyTimeoutMs ?? 7_000,
+    );
+    return { started: true, pid: child.pid ?? ready.pid ?? null, ready: true };
+  } finally {
+    logs.close();
+  }
+}
+
+export async function onboardCommand(options = {}, dependencies = {}) {
+  const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
+  const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
+  if (await credentialsStore.read()) {
+    const ensured = await ensureCommand(options, { ...dependencies, dataDir, credentialsStore });
+    if (ensured.started || ensured.reason === 'already_running' || ensured.reason === 'starting') {
+      return { setupStarted: false, ...ensured };
+    }
+  }
+
+  const onboardingDir = path.join(dataDir, 'onboarding');
+  const onboardingLock = dependencies.onboardingLock ?? new SupervisorProcessLock(onboardingDir);
+  const existing = await onboardingLock.inspect();
+  if (existing?.alive) {
+    return { setupStarted: false, reason: 'setup_in_progress', pid: existing.pid };
+  }
+
+  await mkdir(onboardingDir, { recursive: true, mode: 0o700 });
+  const logs = dependencies.logs ?? openSupervisorLogs(onboardingDir);
+  const script = fileURLToPath(import.meta.url);
+  const args = [script, 'setup'];
+  if (options.api_url) args.push('--api-url', options.api_url);
+  if (options.name) args.push('--name', options.name);
+  if (options.open === false) args.push('--no-open');
+  if (options.codex) args.push('--codex', options.codex);
+  const spawnImpl = dependencies.spawnImpl ?? spawn;
+  try {
+    const child = spawnImpl(process.execPath, args, {
+      detached: true,
+      env: { ...process.env, HARK_DATA_DIR: dataDir },
+      stdio: ['ignore', logs.stdout, logs.stderr],
+    });
+    child.unref?.();
+    return { setupStarted: true, pid: child.pid ?? null };
+  } finally {
+    logs.close();
+  }
+}
+
+export async function doctorCommand(options = {}, dependencies = {}) {
+  const requiredHookEvents = [
+    'SessionStart',
+    'PreToolUse',
+    'PostToolUse',
+    'UserPromptSubmit',
+  ];
+  const exactToolMatcher = 'mcp__hark__hark_await';
+  const pluginRoot = dependencies.pluginRoot ?? CODEX_PLUGIN_ROOT;
+  const hookContract = certifiedHookContract(pluginRoot);
+  const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
+  const checks = [];
+  const check = async (id, operation, remediation) => {
+    try {
+      const detail = await operation();
+      checks.push({ id, ok: true, ...(detail === undefined ? {} : { detail }) });
+      return detail;
+    } catch (error) {
+      checks.push({
+        id,
+        ok: false,
+        error: error?.code ?? error?.message ?? String(error),
+        remediation,
+      });
+      return null;
+    }
+  };
+
+  await check('platform', async () => {
+    const platform = dependencies.platform ?? process.platform;
+    const arch = dependencies.arch ?? process.arch;
+    if (platform !== 'linux' || arch !== 'x64') throw new Error(`unsupported_platform:${platform}-${arch}`);
+    return `${platform}-${arch}`;
+  }, 'Use the certified Linux x64 Hark package.');
+  await check('node', async () => {
+    const nodeVersion = dependencies.nodeVersion ?? process.versions.node;
+    const major = Number(String(nodeVersion).split('.')[0]);
+    if (!Number.isSafeInteger(major) || major < 20) throw new Error(`node_version_unsupported:${nodeVersion}`);
+    return nodeVersion;
+  }, 'Install Node.js 20 or newer.');
+
+  const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
+  let credentials = null;
+  await check('credential', async () => {
+    const value = await credentialsStore.read();
+    if (!value) throw new Error('hark_not_connected');
+    credentials = value;
+    return {
+      installationId: value.installation.id,
+      runtimeId: value.installation.runtimeId,
+    };
+  }, 'Approve the Hark installation in the browser.');
+  const command = configuredCodexCommand(options, dependencies);
+  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
+  const daemonStatus = await check('codex_runtime', () => daemon.inspect(),
+    'Re-run Hark setup to restore the pinned Codex runtime.');
+
+  let appServer = null;
+  let appServerReady = false;
+  if (daemonStatus) {
+    const transportFactory = dependencies.transportFactory
+      ?? createCodexDaemonTransportFactory({ command });
+    appServer = dependencies.appServerClient
+      ?? new AppServerClient({ command, transportFactory });
+    await check('app_server', async () => {
+      await appServer.start();
+      appServerReady = true;
+      return CODEX_APP_SERVER_COMPATIBILITY.protocol;
+    }, 'Restart Hark setup and inspect the local Hark error log.');
+  } else {
+    checks.push({
+      id: 'app_server', ok: false, error: 'codex_runtime_unavailable',
+      remediation: 'Restore the pinned Codex runtime first.',
+    });
+  }
+
+  let clockSource = null;
+  if (appServerReady) {
+    let effectiveConfigPromise = null;
+    const readEffectiveConfig = () => {
+      if (effectiveConfigPromise) return effectiveConfigPromise;
+      effectiveConfigPromise = (async () => {
+        if (typeof appServer.readConfig !== 'function') {
+          throw new Error('codex_config_read_unavailable');
+        }
+        const result = await appServer.readConfig({
+          cwd: dependencies.cwd ?? process.cwd(),
+          includeLayers: false,
+        });
+        if (!result?.config || typeof result.config !== 'object' || Array.isArray(result.config)) {
+          throw new Error('codex_effective_config_unverifiable');
+        }
+        return result.config;
+      })();
+      return effectiveConfigPromise;
+    };
+
+    await check('clock_source', async () => {
+      const config = await readEffectiveConfig();
+      const currentTimeConfig = config.features?.current_time_reminder;
+      clockSource = currentTimeConfig && typeof currentTimeConfig === 'object'
+        ? currentTimeConfig.clock_source ?? 'system'
+        : 'system';
+      if (clockSource !== 'system') throw new Error(`codex_clock_source_unsupported:${clockSource}`);
+      return clockSource;
+    }, 'Use the Codex system clock source for certified Hark wakes.');
+
+    await check('hooks', async () => {
+      if (typeof appServer.listHooks !== 'function') {
+        throw new Error('codex_hooks_list_unavailable');
+      }
+      const result = await appServer.listHooks({ cwds: [dependencies.cwd ?? process.cwd()] });
+      if (!Array.isArray(result?.data)) throw new Error('codex_hooks_response_unverifiable');
+      const discoveryErrors = result.data.flatMap((entry) => (
+        Array.isArray(entry?.errors) ? entry.errors : []
+      ));
+      if (discoveryErrors.length > 0) throw new Error('codex_hooks_discovery_failed');
+      const entries = result.data.flatMap((entry) => entry.hooks ?? []);
+      const hooks = entries.filter((entry) => entry.pluginId === 'hark@hark');
+      for (const eventName of requiredHookEvents) {
+        const matching = hooks.filter((hook) => hook.eventName === eventName);
+        if (matching.length === 0) throw new Error(`hark_hook_missing:${eventName}`);
+        if (matching.length !== 1) {
+          throw new Error(`hark_hook_ambiguous:${eventName}:${matching.length}`);
+        }
+        const [hook] = matching;
+        if (hook.enabled !== true) throw new Error(`hark_hook_not_enabled:${eventName}`);
+        if (!['trusted', 'managed'].includes(hook.trustStatus)) {
+          throw new Error(`hark_hook_not_trusted:${eventName}:${hook.trustStatus ?? 'unknown'}`);
+        }
+        const expectedHook = hookContract[eventName];
+        if (expectedHook.matcher === exactToolMatcher) {
+          if (!Object.hasOwn(hook, 'matcher') || hook.matcher !== exactToolMatcher) {
+            throw new Error(
+              `hark_hook_matcher_invalid:${eventName}:`
+              + (Object.hasOwn(hook, 'matcher') ? (hook.matcher ?? 'null') : 'missing'),
+            );
+          }
+        } else if (hook.matcher != null) {
+          throw new Error(`hark_hook_matcher_invalid:${eventName}:${hook.matcher}`);
+        }
+        if (hook.command !== expectedHook.command) {
+          throw new Error(`hark_hook_command_invalid:${eventName}`);
+        }
+        if (hook.timeout !== expectedHook.timeout) {
+          throw new Error(`hark_hook_timeout_invalid:${eventName}:${String(hook.timeout)}`);
+        }
+      }
+      if (hooks.length !== requiredHookEvents.length) {
+        throw new Error(`hark_hook_surface_invalid:${hooks.length}`);
+      }
+      return requiredHookEvents.slice().sort();
+    }, 'Review, enable, and trust all four bundled Hark hooks in Codex.');
+
+    await check('mcp', async () => {
+      if (typeof appServer.listMcpServerStatus !== 'function') {
+        throw new Error('codex_mcp_status_unavailable');
+      }
+      const result = await appServer.listMcpServerStatus();
+      if (!Array.isArray(result?.data)) throw new Error('codex_mcp_status_unverifiable');
+      const servers = result.data.filter((entry) => entry.name === 'hark');
+      if (servers.length === 0) throw new Error('hark_mcp_missing');
+      if (servers.length !== 1) throw new Error(`hark_mcp_ambiguous:${servers.length}`);
+      const [server] = servers;
+      const tools = Object.keys(server.tools ?? {}).sort();
+      if (tools.length !== 1 || tools[0] !== 'hark_await') {
+        throw new Error(`hark_mcp_tool_surface_invalid:${tools.join(',')}`);
+      }
+      return tools;
+    }, 'Reload the installed Hark plugin in Codex.');
+
+    await check('mcp_config', async () => {
+      const config = await readEffectiveConfig();
+      const servers = config.mcp_servers;
+      if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+        throw new Error('hark_mcp_config_unverifiable:mcp_servers');
+      }
+      const server = servers.hark;
+      if (!server || typeof server !== 'object' || Array.isArray(server)) {
+        throw new Error('hark_mcp_config_unverifiable:hark');
+      }
+      const expected = {
+        command: 'node',
+        args: ['./hark/mcp/server.mjs'],
+        cwd: '.',
+        enabled: true,
+        required: true,
+        supports_parallel_tool_calls: false,
+        enabled_tools: ['hark_await'],
+        default_tools_approval_mode: 'approve',
+        tool_timeout_sec: 31_536_000,
+      };
+      for (const [field, expectedValue] of Object.entries(expected)) {
+        const actualValue = server[field];
+        if (JSON.stringify(actualValue) !== JSON.stringify(expectedValue)) {
+          throw new Error(
+            `hark_mcp_config_drift:${field}:${JSON.stringify(actualValue) ?? 'undefined'}`,
+          );
+        }
+      }
+      if (server.tools !== undefined) {
+        if (!server.tools || typeof server.tools !== 'object' || Array.isArray(server.tools)) {
+          throw new Error('hark_mcp_config_unverifiable:tools');
+        }
+        const override = server.tools.hark_await?.approval_mode;
+        if (override !== undefined && override !== 'approve') {
+          throw new Error(`hark_mcp_config_drift:hark_await_approval_mode:${override}`);
+        }
+      }
+      return expected;
+    }, 'Restore the exact held-call Hark MCP settings and reload Codex.');
+  } else {
+    for (const id of ['clock_source', 'hooks', 'mcp', 'mcp_config']) checks.push({
+      id, ok: false, error: 'app_server_unavailable', remediation: 'Restore the App Server first.',
+    });
+  }
+  if (appServer) await appServer.close().catch(() => undefined);
+
+  await check('hark_api', async () => {
+    if (!credentials) throw new Error('hark_not_connected');
+    const service = dependencies.serviceClient ?? new HarkServiceClient({
+      baseUrl: credentials.apiBaseUrl,
+      accessToken: credentials.accessToken,
+    });
+    const result = await service.getInstallationStatus();
+    if (
+      result.installation.id !== credentials.installation.id
+      || result.installation.runtimeId !== credentials.installation.runtimeId
+    ) throw new Error('installation_identity_mismatch');
+    return { installationId: result.installation.id };
+  }, 'Reconnect Hark with the browser approval flow.');
+
+  const processLock = dependencies.processLock ?? new SupervisorProcessLock(dataDir);
+  const supervisorReady = await check('supervisor', async () => {
+    const ready = await processLock.inspectReady();
+    if (!ready) throw new Error('hark_supervisor_not_ready');
+    if (credentials && ready.runtimeId !== credentials.installation.runtimeId) {
+      throw new Error('hark_supervisor_runtime_mismatch');
+    }
+    return { pid: ready.pid, readyAt: ready.readyAt };
+  }, 'Restart Codex once so Hark can start its local supervisor.');
+
+  return {
+    v: 'hark.codex-doctor.v2',
+    ok: checks.every((entry) => entry.ok),
+    connected: Boolean(credentials),
+    installation: credentials ? {
+      id: credentials.installation.id,
+      protocol: credentials.installation.protocol,
+      runtimeId: credentials.installation.runtimeId,
+    } : null,
+    daemon: daemonStatus,
+    clockSource,
+    supervisor: supervisorReady,
+    checks,
+  };
+}
+
+async function main(argv) {
+  const { command, options } = parseArgs(argv);
+  if (['help', '--help', '-h'].includes(command)) {
+    process.stdout.write(HELP);
+    return;
+  }
+  if (command === 'connect') {
+    const result = await connectCommand(options, {
+      onVerification(value) {
+        process.stdout.write(formatDeviceVerification(value));
+      },
+    });
+    const ensured = await ensureCommand(options);
+    process.stdout.write(result.alreadyConnected
+      ? 'Hark is already connected to this Codex runtime.\n'
+      : 'Hark is connected to this Codex runtime.\n');
+    if (ensured.started || ensured.reason === 'already_running') {
+      process.stdout.write('The Hark Codex supervisor is running.\n');
+    } else {
+      process.stdout.write(`Supervisor pending: ${ensured.reason}. Run hark-codex doctor.\n`);
+    }
+    return;
+  }
+  if (command === 'setup') {
+    const onboardingLock = new SupervisorProcessLock(path.join(defaultHarkDataDir(), 'onboarding'));
+    await onboardingLock.acquire();
+    try {
+      const daemon = await bootstrapDaemonCommand(options);
+      const runtimeOptions = { ...options, codex: daemon.harkCodexPath };
+      const result = await connectCommand(options, {
+        onVerification(value) {
+          process.stdout.write(formatDeviceVerification(value));
+        },
+      });
+      const ensured = await ensureCommand(runtimeOptions);
+      if (!ensured.ready) throw new Error(`supervisor_not_ready:${ensured.reason}`);
+      process.stdout.write(result.alreadyConnected
+        ? 'Hark was already connected; the supervisor is running.\n'
+        : 'Hark is connected; the supervisor is running.\n');
+    } finally {
+      await onboardingLock.release();
+    }
+    return;
+  }
+  if (command === 'onboard') {
+    const result = await onboardCommand(options);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (command === 'ensure') {
+    const result = await ensureCommand(options);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (command === 'doctor') {
+    const result = await doctorCommand(options);
+    process.stdout.write(options.json ? `${JSON.stringify(result)}\n` : [
+      `Hark Codex doctor: ${result.ok ? 'OK' : 'NOT READY'}`,
+      `Codex: ${result.daemon?.appServerVersion ?? 'unavailable'}`,
+      `Daemon: ${result.daemon?.backend ?? 'unavailable'}`,
+      `Managed artifact: ${result.daemon?.managedCodexSha256 ?? 'unavailable'}`,
+      `Clock source: ${result.clockSource ?? 'unavailable'}`,
+      `Hark installation: ${result.connected ? 'connected' : 'not connected'}`,
+      ...result.checks.filter((check) => !check.ok).map(
+        (check) => `Fix ${check.id}: ${check.error}. ${check.remediation}`,
+      ),
+      '',
+    ].join('\n'));
+    return;
+  }
+  if (command === 'run') {
+    const processLock = new SupervisorProcessLock();
+    await processLock.acquire();
+    let runtime;
+    try {
+      runtime = await runCommand(options);
+    } catch (error) {
+      await processLock.release();
+      throw error;
+    }
+    const { supervisor } = runtime;
+    let shutdownPromise = null;
+    const shutdown = (exitCode = null) => {
+      if (exitCode !== null && (process.exitCode === undefined || exitCode !== 0)) {
+        process.exitCode = exitCode;
+      }
+      if (!shutdownPromise) {
+        shutdownPromise = (async () => {
+          // Invalidate externally visible readiness before waiting for any
+          // long-running supervisor loop to wind down.
+          await processLock.release();
+          await supervisor.stop();
+        })();
+      }
+      return shutdownPromise;
+    };
+    let rejectFatal;
+    const fatal = new Promise((_resolve, reject) => { rejectFatal = reject; });
+    const onFatal = (error) => {
+      const exact = error instanceof Error ? error : new Error(String(error));
+      void shutdown(1).catch(() => undefined);
+      rejectFatal(exact);
+    };
+    const onSignal = () => { void shutdown(0).catch(() => undefined); };
+    supervisor.once('supervisorError', onFatal);
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+    try {
+      supervisor.assertHealthy();
+      await Promise.race([
+        processLock.markReady({
+          runtimeId: runtime.credentials.installation.runtimeId,
+          installationId: runtime.credentials.installation.id,
+          codexVersion: CODEX_APP_SERVER_COMPATIBILITY.codexVersion,
+        }),
+        fatal,
+      ]);
+      supervisor.assertHealthy();
+      await Promise.race([
+        new Promise((resolve) => supervisor.once('close', resolve)),
+        fatal,
+      ]);
+    } finally {
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      supervisor.off('supervisorError', onFatal);
+      await shutdown();
+    }
+    return;
+  }
+  throw new Error(`unknown_command:${command}`);
+}
+
+if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+  void main(process.argv.slice(2)).catch((error) => {
+    process.stderr.write(`hark-codex: ${error?.message ?? String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
+
+export {
+  formatDeviceVerification,
+  HELP,
+  main,
+  openUrl,
+  parseArgs,
+  runProcess,
+  wait,
+  waitForSupervisorReady,
+};

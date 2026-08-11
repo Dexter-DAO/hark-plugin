@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "hark": {
+      "command": "node",
+      "args": ["./hark/mcp/server.mjs"],
+      "cwd": ".",
+      "enabled": true,
+      "required": true,
+      "supports_parallel_tool_calls": false,
+      "enabled_tools": ["hark_await"],
+      "default_tools_approval_mode": "approve",
+      "tool_timeout_sec": 31536000
+    }
+  }
+}

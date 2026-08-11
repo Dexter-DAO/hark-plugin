@@ -1,0 +1,20 @@
+{
+  "name": "hark",
+  "interface": {
+    "displayName": "Hark"
+  },
+  "plugins": [
+    {
+      "name": "hark",
+      "source": {
+        "source": "local",
+        "path": "./plugins"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
