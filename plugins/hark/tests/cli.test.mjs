@@ -226,6 +226,13 @@ const CERTIFIED_MCP_CONFIG = Object.freeze({
 
 const TEST_PLUGIN_ROOT = '/opt/hark-plugin';
 
+const APP_SERVER_HOOK_EVENTS = Object.freeze({
+  SessionStart: 'sessionStart',
+  PreToolUse: 'preToolUse',
+  PostToolUse: 'postToolUse',
+  UserPromptSubmit: 'userPromptSubmit',
+});
+
 const HOOK_CONTRACT = Object.freeze({
   SessionStart: {
     command: `node "${TEST_PLUGIN_ROOT}/hark/cli/hark-codex.mjs" onboard --json`, timeout: 10,
@@ -243,14 +250,17 @@ const HOOK_CONTRACT = Object.freeze({
 
 function certifiedHooks() {
   return ['SessionStart', 'PreToolUse', 'PostToolUse', 'UserPromptSubmit'].map(
-    (eventName) => ({
+    (contractName) => ({
       pluginId: 'hark@hark',
-      eventName,
+      eventName: APP_SERVER_HOOK_EVENTS[contractName],
+      handlerType: 'command',
+      source: 'plugin',
+      sourcePath: path.join(TEST_PLUGIN_ROOT, 'hooks', 'hooks.json'),
       enabled: true,
       trustStatus: 'trusted',
-      command: HOOK_CONTRACT[eventName].command,
-      timeout: HOOK_CONTRACT[eventName].timeout,
-      matcher: ['PreToolUse', 'PostToolUse'].includes(eventName)
+      command: HOOK_CONTRACT[contractName].command,
+      timeoutSec: HOOK_CONTRACT[contractName].timeout,
+      matcher: ['PreToolUse', 'PostToolUse'].includes(contractName)
         ? 'mcp__hark__hark_await'
         : null,
     }),
@@ -274,7 +284,7 @@ function doctorFixture(overrides = {}) {
     features: {
       current_time_reminder: { clock_source: overrides.clockSource ?? 'system' },
     },
-    mcp_servers: { hark: structuredClone(CERTIFIED_MCP_CONFIG) },
+    mcp_servers: {},
   };
   const appServerClient = {
     async start() {},
@@ -289,7 +299,11 @@ function doctorFixture(overrides = {}) {
     },
     async listMcpServerStatus() {
       return {
-        data: [{ name: 'hark', tools: overrides.mcpTools ?? { hark_await: {} } }],
+        data: [{
+          name: 'hark',
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.2' },
+          tools: overrides.mcpTools ?? { hark_await: {} },
+        }],
       };
     },
     async close() { state.closed = true; },
@@ -322,6 +336,20 @@ function doctorFixture(overrides = {}) {
         async inspectReady() {
           return { pid: 1234, readyAt: '2026-08-07T12:00:00.000Z', runtimeId: 'runtime-1' };
         },
+      },
+      readFile: async (file, encoding) => {
+        assert.equal(encoding, 'utf8');
+        if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
+          return overrides.pluginManifestSource ?? JSON.stringify({
+            name: 'hark', version: '0.1.2', mcpServers: './.mcp.json',
+          });
+        }
+        if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
+          return overrides.mcpPackageSource ?? JSON.stringify({
+            mcpServers: { hark: CERTIFIED_MCP_CONFIG },
+          });
+        }
+        throw new Error(`unexpected_read:${file}`);
       },
     },
   };
@@ -359,65 +387,87 @@ test('doctor fails closed on held-call hook drift', async (t) => {
   const scenarios = [
     {
       name: 'missing PreToolUse',
-      hooks: certifiedHooks().filter((hook) => hook.eventName !== 'PreToolUse'),
+      hooks: certifiedHooks().filter(
+        (hook) => hook.eventName !== APP_SERVER_HOOK_EVENTS.PreToolUse,
+      ),
       error: 'hark_hook_missing:PreToolUse',
     },
     {
       name: 'disabled PostToolUse',
       hooks: certifiedHooks().map((hook) => (
-        hook.eventName === 'PostToolUse' ? { ...hook, enabled: false } : hook
+        hook.eventName === APP_SERVER_HOOK_EVENTS.PostToolUse
+          ? { ...hook, enabled: false }
+          : hook
       )),
       error: 'hark_hook_not_enabled:PostToolUse',
     },
     {
       name: 'untrusted SessionStart',
       hooks: certifiedHooks().map((hook) => (
-        hook.eventName === 'SessionStart' ? { ...hook, trustStatus: 'untrusted' } : hook
+        hook.eventName === APP_SERVER_HOOK_EVENTS.SessionStart
+          ? { ...hook, trustStatus: 'untrusted' }
+          : hook
       )),
       error: 'hark_hook_not_trusted:SessionStart:untrusted',
     },
     {
       name: 'broad PreToolUse matcher',
       hooks: certifiedHooks().map((hook) => (
-        hook.eventName === 'PreToolUse' ? { ...hook, matcher: 'mcp__hark__.*' } : hook
+        hook.eventName === APP_SERVER_HOOK_EVENTS.PreToolUse
+          ? { ...hook, matcher: 'mcp__hark__.*' }
+          : hook
       )),
       error: 'hark_hook_matcher_invalid:PreToolUse:mcp__hark__.*',
     },
     {
       name: 'missing PostToolUse matcher',
       hooks: certifiedHooks().map((hook) => {
-        if (hook.eventName !== 'PostToolUse') return hook;
+        if (hook.eventName !== APP_SERVER_HOOK_EVENTS.PostToolUse) return hook;
         const { matcher: _matcher, ...withoutMatcher } = hook;
         return withoutMatcher;
       }),
       error: 'hark_hook_matcher_invalid:PostToolUse:missing',
     },
     {
+      name: 'wrong SessionStart source',
+      hooks: certifiedHooks().map((hook) => (
+        hook.eventName === APP_SERVER_HOOK_EVENTS.SessionStart
+          ? { ...hook, sourcePath: '/tmp/hooks.json' }
+          : hook
+      )),
+      error: 'hark_hook_source_invalid:SessionStart',
+    },
+    {
       name: 'wrong SessionStart command',
       hooks: certifiedHooks().map((hook) => (
-        hook.eventName === 'SessionStart' ? { ...hook, command: 'node other.mjs' } : hook
+        hook.eventName === APP_SERVER_HOOK_EVENTS.SessionStart
+          ? { ...hook, command: 'node other.mjs' }
+          : hook
       )),
       error: 'hark_hook_command_invalid:SessionStart',
     },
     {
       name: 'wrong UserPromptSubmit timeout',
       hooks: certifiedHooks().map((hook) => (
-        hook.eventName === 'UserPromptSubmit' ? { ...hook, timeout: 6 } : hook
+        hook.eventName === APP_SERVER_HOOK_EVENTS.UserPromptSubmit
+          ? { ...hook, timeoutSec: 6 }
+          : hook
       )),
       error: 'hark_hook_timeout_invalid:UserPromptSubmit:6',
     },
     {
       name: 'duplicate PostToolUse',
       hooks: [...certifiedHooks(), certifiedHooks().find(
-        (hook) => hook.eventName === 'PostToolUse',
+        (hook) => hook.eventName === APP_SERVER_HOOK_EVENTS.PostToolUse,
       )],
       error: 'hark_hook_ambiguous:PostToolUse:2',
     },
     {
       name: 'unexpected fifth Hark hook',
       hooks: [...certifiedHooks(), {
-        pluginId: 'hark@hark', eventName: 'Stop', enabled: true, trustStatus: 'trusted',
-        command: 'true', timeout: 1, matcher: null,
+        pluginId: 'hark@hark', eventName: 'stop', handlerType: 'command', enabled: true,
+        source: 'plugin', sourcePath: path.join(TEST_PLUGIN_ROOT, 'hooks', 'hooks.json'),
+        trustStatus: 'trusted', command: 'true', timeoutSec: 1, matcher: null,
       }],
       error: 'hark_hook_surface_invalid:5',
     },
@@ -432,7 +482,7 @@ test('doctor fails closed on held-call hook drift', async (t) => {
   }
 });
 
-test('doctor fails closed on effective Hark MCP drift or unverifiable config', async (t) => {
+test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t) => {
   const withMcp = (patch) => ({
     features: { current_time_reminder: { clock_source: 'system' } },
     mcp_servers: { hark: { ...structuredClone(CERTIFIED_MCP_CONFIG), ...patch } },
@@ -490,9 +540,9 @@ test('doctor fails closed on effective Hark MCP drift or unverifiable config', a
       const fixture = doctorFixture({ config: scenario.config });
       const result = await doctorCommand({}, fixture.dependencies);
       assert.equal(result.ok, false);
-      assert.match(
+      assert.equal(
         result.checks.find((check) => check.id === 'mcp_config').error,
-        new RegExp(`^hark_mcp_config_drift:${scenario.field}:`),
+        'hark_mcp_config_shadowed:hark',
       );
     });
   }
@@ -507,7 +557,7 @@ test('doctor fails closed on effective Hark MCP drift or unverifiable config', a
     );
   });
 
-  await t.test('Hark server absent from effective config', async () => {
+  await t.test('plugin-injected Hark server may be absent from config/read', async () => {
     const fixture = doctorFixture({
       config: {
         features: { current_time_reminder: { clock_source: 'system' } },
@@ -515,10 +565,48 @@ test('doctor fails closed on effective Hark MCP drift or unverifiable config', a
       },
     });
     const result = await doctorCommand({}, fixture.dependencies);
+    assert.equal(result.checks.find((check) => check.id === 'mcp_config').ok, true);
+  });
+
+  await t.test('packaged Hark MCP server is required', async () => {
+    const fixture = doctorFixture({
+      mcpPackageSource: JSON.stringify({ mcpServers: {} }),
+    });
+    const result = await doctorCommand({}, fixture.dependencies);
     assert.equal(result.ok, false);
     assert.equal(
       result.checks.find((check) => check.id === 'mcp_config').error,
-      'hark_mcp_config_unverifiable:hark',
+      'hark_mcp_package_surface_invalid:',
+    );
+  });
+
+  await t.test('packaged Hark MCP surface rejects extra execution fields', async () => {
+    const fixture = doctorFixture({
+      mcpPackageSource: JSON.stringify({
+        mcpServers: {
+          hark: { ...CERTIFIED_MCP_CONFIG, env: { HARK_DATA_DIR: '/tmp/other' } },
+        },
+      }),
+    });
+    const result = await doctorCommand({}, fixture.dependencies);
+    assert.equal(result.ok, false);
+    assert.match(
+      result.checks.find((check) => check.id === 'mcp_config').error,
+      /^hark_mcp_config_surface_invalid:package_hark:/,
+    );
+  });
+
+  await t.test('packaged Hark MCP settings reject field drift', async () => {
+    const fixture = doctorFixture({
+      mcpPackageSource: JSON.stringify({
+        mcpServers: { hark: { ...CERTIFIED_MCP_CONFIG, required: false } },
+      }),
+    });
+    const result = await doctorCommand({}, fixture.dependencies);
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.checks.find((check) => check.id === 'mcp_config').error,
+      'hark_mcp_config_drift:required:false',
     );
   });
 
@@ -529,6 +617,30 @@ test('doctor fails closed on effective Hark MCP drift or unverifiable config', a
     assert.equal(
       result.checks.find((check) => check.id === 'mcp').error,
       'hark_mcp_tool_surface_invalid:extra,hark_await',
+    );
+  });
+
+  await t.test('runtime MCP identity must match the installed plugin version', async () => {
+    const fixture = doctorFixture({ mcpServerInfo: { name: 'hark', version: '0.1.0' } });
+    const result = await doctorCommand({}, fixture.dependencies);
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.checks.find((check) => check.id === 'mcp').error,
+      'hark_mcp_server_identity_invalid:hark:0.1.0',
+    );
+  });
+
+  await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
+    const fixture = doctorFixture({
+      pluginManifestSource: JSON.stringify({
+        name: 'hark', version: '0.1.2', mcpServers: './other.mcp.json',
+      }),
+    });
+    const result = await doctorCommand({}, fixture.dependencies);
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.checks.find((check) => check.id === 'mcp').error,
+      'hark_plugin_manifest_invalid',
     );
   });
 });

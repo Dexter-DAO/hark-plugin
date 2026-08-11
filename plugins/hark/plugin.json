@@ -1,14 +1,14 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hark",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Portable Hark durable-await core. Requires a certified host adapter; the Codex adapter ships in the parent package.",
   "author": {
     "name": "Dexter",
     "url": "https://dexter.cash"
   },
   "homepage": "https://hark.sh",
-  "repository": "https://github.com/Dexter-DAO/hark",
+  "repository": "https://github.com/Dexter-DAO/hark-plugin",
   "license": "LicenseRef-Proprietary",
   "keywords": ["agents", "durable-waits", "continuations", "hark"]
 }

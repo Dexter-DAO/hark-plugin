@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -460,10 +460,10 @@ export async function onboardCommand(options = {}, dependencies = {}) {
 
 export async function doctorCommand(options = {}, dependencies = {}) {
   const requiredHookEvents = [
-    'SessionStart',
-    'PreToolUse',
-    'PostToolUse',
-    'UserPromptSubmit',
+    { contractName: 'SessionStart', appServerName: 'sessionStart' },
+    { contractName: 'PreToolUse', appServerName: 'preToolUse' },
+    { contractName: 'PostToolUse', appServerName: 'postToolUse' },
+    { contractName: 'UserPromptSubmit', appServerName: 'userPromptSubmit' },
   ];
   const exactToolMatcher = 'mcp__hark__hark_await';
   const pluginRoot = dependencies.pluginRoot ?? CODEX_PLUGIN_ROOT;
@@ -577,39 +577,50 @@ export async function doctorCommand(options = {}, dependencies = {}) {
       if (discoveryErrors.length > 0) throw new Error('codex_hooks_discovery_failed');
       const entries = result.data.flatMap((entry) => entry.hooks ?? []);
       const hooks = entries.filter((entry) => entry.pluginId === 'hark@hark');
-      for (const eventName of requiredHookEvents) {
-        const matching = hooks.filter((hook) => hook.eventName === eventName);
-        if (matching.length === 0) throw new Error(`hark_hook_missing:${eventName}`);
+      for (const { contractName, appServerName } of requiredHookEvents) {
+        const matching = hooks.filter((hook) => hook.eventName === appServerName);
+        if (matching.length === 0) throw new Error(`hark_hook_missing:${contractName}`);
         if (matching.length !== 1) {
-          throw new Error(`hark_hook_ambiguous:${eventName}:${matching.length}`);
+          throw new Error(`hark_hook_ambiguous:${contractName}:${matching.length}`);
         }
         const [hook] = matching;
-        if (hook.enabled !== true) throw new Error(`hark_hook_not_enabled:${eventName}`);
-        if (!['trusted', 'managed'].includes(hook.trustStatus)) {
-          throw new Error(`hark_hook_not_trusted:${eventName}:${hook.trustStatus ?? 'unknown'}`);
+        const expectedSourcePath = path.join(pluginRoot, 'hooks', 'hooks.json');
+        if (hook.source !== 'plugin' || hook.sourcePath !== expectedSourcePath) {
+          throw new Error(`hark_hook_source_invalid:${contractName}`);
         }
-        const expectedHook = hookContract[eventName];
+        if (hook.handlerType !== 'command') {
+          throw new Error(`hark_hook_handler_invalid:${contractName}:${hook.handlerType ?? 'unknown'}`);
+        }
+        if (hook.enabled !== true) throw new Error(`hark_hook_not_enabled:${contractName}`);
+        if (!['trusted', 'managed'].includes(hook.trustStatus)) {
+          throw new Error(
+            `hark_hook_not_trusted:${contractName}:${hook.trustStatus ?? 'unknown'}`,
+          );
+        }
+        const expectedHook = hookContract[contractName];
         if (expectedHook.matcher === exactToolMatcher) {
           if (!Object.hasOwn(hook, 'matcher') || hook.matcher !== exactToolMatcher) {
             throw new Error(
-              `hark_hook_matcher_invalid:${eventName}:`
+              `hark_hook_matcher_invalid:${contractName}:`
               + (Object.hasOwn(hook, 'matcher') ? (hook.matcher ?? 'null') : 'missing'),
             );
           }
         } else if (hook.matcher != null) {
-          throw new Error(`hark_hook_matcher_invalid:${eventName}:${hook.matcher}`);
+          throw new Error(`hark_hook_matcher_invalid:${contractName}:${hook.matcher}`);
         }
         if (hook.command !== expectedHook.command) {
-          throw new Error(`hark_hook_command_invalid:${eventName}`);
+          throw new Error(`hark_hook_command_invalid:${contractName}`);
         }
-        if (hook.timeout !== expectedHook.timeout) {
-          throw new Error(`hark_hook_timeout_invalid:${eventName}:${String(hook.timeout)}`);
+        if (hook.timeoutSec !== expectedHook.timeout) {
+          throw new Error(
+            `hark_hook_timeout_invalid:${contractName}:${String(hook.timeoutSec)}`,
+          );
         }
       }
       if (hooks.length !== requiredHookEvents.length) {
         throw new Error(`hark_hook_surface_invalid:${hooks.length}`);
       }
-      return requiredHookEvents.slice().sort();
+      return requiredHookEvents.map(({ contractName }) => contractName).sort();
     }, 'Review, enable, and trust all four bundled Hark hooks in Codex.');
 
     await check('mcp', async () => {
@@ -626,19 +637,32 @@ export async function doctorCommand(options = {}, dependencies = {}) {
       if (tools.length !== 1 || tools[0] !== 'hark_await') {
         throw new Error(`hark_mcp_tool_surface_invalid:${tools.join(',')}`);
       }
+      const readFileImpl = dependencies.readFile ?? readFile;
+      let manifest;
+      try {
+        manifest = JSON.parse(await readFileImpl(
+          path.join(pluginRoot, '.codex-plugin', 'plugin.json'),
+          'utf8',
+        ));
+      } catch {
+        throw new Error('hark_plugin_manifest_unreadable');
+      }
+      if (manifest?.name !== 'hark' || typeof manifest?.version !== 'string'
+        || !manifest.version || manifest.mcpServers !== './.mcp.json') {
+        throw new Error('hark_plugin_manifest_invalid');
+      }
+      if (server.serverInfo?.name !== 'hark'
+        || server.serverInfo?.version !== manifest.version) {
+        throw new Error(
+          `hark_mcp_server_identity_invalid:${server.serverInfo?.name ?? 'unknown'}:`
+          + `${server.serverInfo?.version ?? 'unknown'}`,
+        );
+      }
       return tools;
     }, 'Reload the installed Hark plugin in Codex.');
 
     await check('mcp_config', async () => {
       const config = await readEffectiveConfig();
-      const servers = config.mcp_servers;
-      if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
-        throw new Error('hark_mcp_config_unverifiable:mcp_servers');
-      }
-      const server = servers.hark;
-      if (!server || typeof server !== 'object' || Array.isArray(server)) {
-        throw new Error('hark_mcp_config_unverifiable:hark');
-      }
       const expected = {
         command: 'node',
         args: ['./hark/mcp/server.mjs'],
@@ -650,21 +674,59 @@ export async function doctorCommand(options = {}, dependencies = {}) {
         default_tools_approval_mode: 'approve',
         tool_timeout_sec: 31_536_000,
       };
-      for (const [field, expectedValue] of Object.entries(expected)) {
-        const actualValue = server[field];
-        if (JSON.stringify(actualValue) !== JSON.stringify(expectedValue)) {
-          throw new Error(
-            `hark_mcp_config_drift:${field}:${JSON.stringify(actualValue) ?? 'undefined'}`,
-          );
+      const validateServer = (server, source) => {
+        if (!server || typeof server !== 'object' || Array.isArray(server)) {
+          throw new Error(`hark_mcp_config_unverifiable:${source}`);
         }
+        const allowedFields = Object.keys(expected).sort();
+        const actualFields = Object.keys(server).sort();
+        if (JSON.stringify(actualFields) !== JSON.stringify(allowedFields)) {
+          throw new Error(`hark_mcp_config_surface_invalid:${source}:${actualFields.join(',')}`);
+        }
+        for (const [field, expectedValue] of Object.entries(expected)) {
+          const actualValue = server[field];
+          if (JSON.stringify(actualValue) !== JSON.stringify(expectedValue)) {
+            throw new Error(
+              `hark_mcp_config_drift:${field}:${JSON.stringify(actualValue) ?? 'undefined'}`,
+            );
+          }
+        }
+      };
+
+      const readFileImpl = dependencies.readFile ?? readFile;
+      const packagePath = path.join(pluginRoot, '.mcp.json');
+      let packageConfig;
+      try {
+        packageConfig = JSON.parse(await readFileImpl(packagePath, 'utf8'));
+      } catch {
+        throw new Error('hark_mcp_package_unreadable');
       }
-      if (server.tools !== undefined) {
-        if (!server.tools || typeof server.tools !== 'object' || Array.isArray(server.tools)) {
-          throw new Error('hark_mcp_config_unverifiable:tools');
+      if (!packageConfig || typeof packageConfig !== 'object' || Array.isArray(packageConfig)
+        || JSON.stringify(Object.keys(packageConfig).sort()) !== JSON.stringify(['mcpServers'])) {
+        throw new Error('hark_mcp_package_surface_invalid:root');
+      }
+      const packagedServers = packageConfig?.mcpServers;
+      if (!packagedServers || typeof packagedServers !== 'object'
+        || Array.isArray(packagedServers)) {
+        throw new Error('hark_mcp_config_unverifiable:package');
+      }
+      const packagedNames = Object.keys(packagedServers).sort();
+      if (JSON.stringify(packagedNames) !== JSON.stringify(['hark'])) {
+        throw new Error(`hark_mcp_package_surface_invalid:${packagedNames.join(',')}`);
+      }
+      validateServer(packagedServers.hark, 'package_hark');
+
+      // Codex 0.147 config/read reports user/project MCP configuration, not the
+      // MCP settings injected by an installed plugin. Any same-name entry is an
+      // ambiguous shadow: relative cwd and precedence differ by source layer.
+      const configuredServers = config.mcp_servers;
+      if (configuredServers !== undefined) {
+        if (!configuredServers || typeof configuredServers !== 'object'
+          || Array.isArray(configuredServers)) {
+          throw new Error('hark_mcp_config_unverifiable:mcp_servers');
         }
-        const override = server.tools.hark_await?.approval_mode;
-        if (override !== undefined && override !== 'approve') {
-          throw new Error(`hark_mcp_config_drift:hark_await_approval_mode:${override}`);
+        if (Object.hasOwn(configuredServers, 'hark')) {
+          throw new Error('hark_mcp_config_shadowed:hark');
         }
       }
       return expected;

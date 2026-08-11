@@ -1,13 +1,13 @@
 {
   "name": "hark",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Durable external waits and exact-task continuation for AI agents.",
   "author": {
     "name": "Dexter",
     "url": "https://dexter.cash"
   },
   "homepage": "https://hark.sh",
-  "repository": "https://github.com/Dexter-DAO/hark",
+  "repository": "https://github.com/Dexter-DAO/hark-plugin",
   "license": "LicenseRef-Proprietary",
   "keywords": ["agents", "durable-waits", "continuations", "hark"],
   "skills": "./hark/skills/",
