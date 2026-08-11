@@ -17,7 +17,7 @@ are never model inputs. The parent package includes the Codex adapter.
 Add this repository as a Codex plugin marketplace and install **Hark**:
 
 ```bash
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.3
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.4
 codex plugin add hark@hark
 ```
 
@@ -29,9 +29,10 @@ the installed plugin root:
 node ./hark/cli/hark-codex.mjs setup --no-open
 ```
 
-Hark setup pins and verifies both the Codex 0.147 executable and its required
-`codex-code-mode-host` sibling. Existing installations missing only the host
-are repaired without replacing the already-verified Codex executable.
+Hark setup pins and verifies the Codex 0.147 executable, its required
+`codex-code-mode-host` sibling, and the official bundled Bubblewrap helper used
+by Codex's normal Linux sandbox profiles. Existing installations missing a
+companion are repaired without replacing already-verified runtime files.
 
 The command visibly prints both fields needed by a headless Linux install:
 

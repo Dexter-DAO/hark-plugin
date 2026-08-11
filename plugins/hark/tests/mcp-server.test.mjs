@@ -225,7 +225,7 @@ test('lists only the elegant one-call durable wait tool', async () => {
     { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
   ]);
   assert.equal(responses[0].result.serverInfo.name, 'hark');
-  assert.equal(responses[0].result.serverInfo.version, '0.1.3');
+  assert.equal(responses[0].result.serverInfo.version, '0.1.4');
   assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['hark_await']);
   assert.deepEqual(responses[1].result.tools[0].inputSchema.required, [
     'request', 'name', 'source', 'condition',

@@ -4,10 +4,10 @@ Public distribution of the Hark durable-await plugin for Codex.
 
 Hark lets one Codex task stop inference while it waits for an authenticated external event, then resume the same originating tool call exactly once.
 
-## Install v0.1.3
+## Install v0.1.4
 
 ```sh
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.3
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.4
 codex plugin add hark@hark
 ```
 
@@ -18,9 +18,10 @@ node ./hark/cli/hark-codex.mjs setup --no-open
 node ./hark/cli/hark-codex.mjs doctor
 ```
 
-Setup pins and verifies both Codex 0.147 and its required
-`codex-code-mode-host` sibling. It also repairs an existing Hark installation
-that has the correct Codex executable but is missing that host.
+Setup pins and verifies Codex 0.147, its required `codex-code-mode-host`
+sibling, and the official bundled Bubblewrap helper used by Codex's normal
+Linux sandbox profiles. It repairs missing companions without replacing
+already-verified runtime files.
 
 The plugin talks to the public Hark service through `https://api.dexter.cash` and `https://hark.sh`.
 
@@ -28,8 +29,8 @@ This repository is a release-only distribution mirror. Hark is proprietary softw
 
 Release provenance:
 
-- Hark release: `155340899135-c66a82380d09`
-- Source commit: `1553408991359747810bf488114bbf869428070a`
-- Source tree: `f28c29f221b4896495fcc96608135cb938aba8e3`
-- Artifact digest: `c66a82380d0901298c60935771334467810e7888eef6b990017d69350492b8c5`
-- Plugin digest: `1fca58c761b7515bba57acc24b347394992176cd24dd10e4fb297a4b7a5ca041`
+- Hark release: `afa285ccdcce-0cfd564cd779`
+- Source commit: `afa285ccdcce7075db9652ed82b7ba64ee2227d7`
+- Source tree: `ab6ecdc5259c67e923bfb337b2b1432b63cdcb8a`
+- Artifact digest: `0cfd564cd779c6e23bd06711cc244169b789b971ece1f418cf7238156dd32268`
+- Plugin digest: `3e38cca6c4e5f36a7ea51d03ea13527c66270529342bd7ef86178cd4e4482477`

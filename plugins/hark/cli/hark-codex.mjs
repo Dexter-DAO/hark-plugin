@@ -362,6 +362,8 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
     harkCodexPath: command,
     codeModeHostPath: runtime.codeModeHostPath,
     codeModeHostSha256: runtime.codeModeHostSha256,
+    bwrapPath: runtime.bwrapPath,
+    bwrapSha256: runtime.bwrapSha256,
   };
 }
 
@@ -790,6 +792,24 @@ export async function doctorCommand(options = {}, dependencies = {}) {
   };
 }
 
+function formatDoctorOutput(result) {
+  return [
+    `Hark Codex doctor: ${result.ok ? 'OK' : 'NOT READY'}`,
+    `Codex: ${result.daemon?.appServerVersion ?? 'unavailable'}`,
+    `Daemon: ${result.daemon?.backend ?? 'unavailable'}`,
+    `Managed artifact: ${result.daemon?.managedCodexSha256 ?? 'unavailable'}`,
+    `Code-mode host: ${result.runtime?.codeModeHostSha256 ?? 'unavailable'}`,
+    `Bubblewrap: ${result.runtime?.bwrapPath ?? 'unavailable'}`,
+    `Bubblewrap SHA-256: ${result.runtime?.bwrapSha256 ?? 'unavailable'}`,
+    `Clock source: ${result.clockSource ?? 'unavailable'}`,
+    `Hark installation: ${result.connected ? 'connected' : 'not connected'}`,
+    ...result.checks.filter((check) => !check.ok).map(
+      (check) => `Fix ${check.id}: ${check.error}. ${check.remediation}`,
+    ),
+    '',
+  ].join('\n');
+}
+
 async function main(argv) {
   const { command, options } = parseArgs(argv);
   if (['help', '--help', '-h'].includes(command)) {
@@ -846,19 +866,7 @@ async function main(argv) {
   }
   if (command === 'doctor') {
     const result = await doctorCommand(options);
-    process.stdout.write(options.json ? `${JSON.stringify(result)}\n` : [
-      `Hark Codex doctor: ${result.ok ? 'OK' : 'NOT READY'}`,
-      `Codex: ${result.daemon?.appServerVersion ?? 'unavailable'}`,
-      `Daemon: ${result.daemon?.backend ?? 'unavailable'}`,
-      `Managed artifact: ${result.daemon?.managedCodexSha256 ?? 'unavailable'}`,
-      `Code-mode host: ${result.runtime?.codeModeHostSha256 ?? 'unavailable'}`,
-      `Clock source: ${result.clockSource ?? 'unavailable'}`,
-      `Hark installation: ${result.connected ? 'connected' : 'not connected'}`,
-      ...result.checks.filter((check) => !check.ok).map(
-        (check) => `Fix ${check.id}: ${check.error}. ${check.remediation}`,
-      ),
-      '',
-    ].join('\n'));
+    process.stdout.write(options.json ? `${JSON.stringify(result)}\n` : formatDoctorOutput(result));
     return;
   }
   if (command === 'run') {
@@ -932,6 +940,7 @@ if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).
 }
 
 export {
+  formatDoctorOutput,
   formatDeviceVerification,
   HELP,
   main,

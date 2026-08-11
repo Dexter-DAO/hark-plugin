@@ -1,10 +1,10 @@
 {
   "v": "hark.plugin-distribution.v1",
-  "version": "0.1.3",
-  "releaseId": "155340899135-c66a82380d09",
-  "sourceCommit": "1553408991359747810bf488114bbf869428070a",
-  "sourceTree": "f28c29f221b4896495fcc96608135cb938aba8e3",
-  "artifactSha256": "c66a82380d0901298c60935771334467810e7888eef6b990017d69350492b8c5",
-  "pluginDigest": "1fca58c761b7515bba57acc24b347394992176cd24dd10e4fb297a4b7a5ca041",
+  "version": "0.1.4",
+  "releaseId": "afa285ccdcce-0cfd564cd779",
+  "sourceCommit": "afa285ccdcce7075db9652ed82b7ba64ee2227d7",
+  "sourceTree": "ab6ecdc5259c67e923bfb337b2b1432b63cdcb8a",
+  "artifactSha256": "0cfd564cd779c6e23bd06711cc244169b789b971ece1f418cf7238156dd32268",
+  "pluginDigest": "3e38cca6c4e5f36a7ea51d03ea13527c66270529342bd7ef86178cd4e4482477",
   "license": "LicenseRef-Proprietary"
 }

@@ -73,7 +73,7 @@ async function completeHandshake(client, transport) {
       clientInfo: {
         name: 'hark-codex-supervisor',
         title: 'Hark Codex Supervisor',
-        version: '0.1.3',
+        version: '0.1.4',
       },
       capabilities: { experimentalApi: true },
     },

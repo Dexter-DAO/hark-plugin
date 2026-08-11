@@ -11,6 +11,7 @@ import {
   createSupervisorRuntime,
   doctorCommand,
   ensureCommand,
+  formatDoctorOutput,
   formatDeviceVerification,
   onboardCommand,
   parseArgs,
@@ -57,6 +58,8 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
         path: command,
         codeModeHostPath: '/opt/codex-code-mode-host',
         codeModeHostSha256: 'host-sha256',
+        bwrapPath: '/opt/codex-resources/bwrap',
+        bwrapSha256: 'bwrap-sha256',
       };
     },
     runProcess: async (command, args) => {
@@ -77,6 +80,8 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
   assert.equal(status.harkCodexPath, '/opt/codex-0.147.0');
   assert.equal(status.codeModeHostPath, '/opt/codex-code-mode-host');
   assert.equal(status.codeModeHostSha256, 'host-sha256');
+  assert.equal(status.bwrapPath, '/opt/codex-resources/bwrap');
+  assert.equal(status.bwrapSha256, 'bwrap-sha256');
 });
 
 test('setup performs no Codex or daemon command when the sibling host fails verification', async () => {
@@ -104,11 +109,13 @@ test('setup performs no Codex or daemon command when the sibling host fails veri
 test('setup refuses a version mismatch before daemon mutation', async () => {
   const calls = [];
   await assert.rejects(
-    bootstrapDaemonCommand({ codex: '/usr/bin/codex' }, {
+    bootstrapDaemonCommand({ codex: '/opt/hark-codex/codex' }, {
       verifyPinnedCodexRuntime: async (command) => ({
         path: command,
-        codeModeHostPath: '/usr/bin/codex-code-mode-host',
+        codeModeHostPath: '/opt/hark-codex/codex-code-mode-host',
         codeModeHostSha256: 'host-sha256',
+        bwrapPath: '/opt/hark-codex/codex-resources/bwrap',
+        bwrapSha256: 'bwrap-sha256',
       }),
       runProcess: async (command, args) => {
         calls.push([command, args]);
@@ -117,7 +124,7 @@ test('setup refuses a version mismatch before daemon mutation', async () => {
     }),
     /codex_version_gate_failed:0\.146\.1:0\.147\.0/,
   );
-  assert.deepEqual(calls, [['/usr/bin/codex', ['--version']]]);
+  assert.deepEqual(calls, [['/opt/hark-codex/codex', ['--version']]]);
 });
 
 test('setup installs and reuses the managed pinned runtime without launching an updater', async () => {
@@ -135,6 +142,8 @@ test('setup installs and reuses the managed pinned runtime without launching an 
       path: command,
       codeModeHostPath: '/tmp/hark-codex-home/packages/standalone/current/codex-code-mode-host',
       codeModeHostSha256: 'host-sha256',
+      bwrapPath: '/tmp/hark-codex-home/packages/standalone/current/codex-resources/bwrap',
+      bwrapSha256: 'bwrap-sha256',
     }),
     runProcess: async (command, args) => {
       calls.push([command, args]);
@@ -152,6 +161,11 @@ test('setup installs and reuses the managed pinned runtime without launching an 
     },
   });
   assert.equal(status.harkCodexPath, '/tmp/hark-codex-home/packages/standalone/current/codex');
+  assert.equal(
+    status.bwrapPath,
+    '/tmp/hark-codex-home/packages/standalone/current/codex-resources/bwrap',
+  );
+  assert.equal(status.bwrapSha256, 'bwrap-sha256');
   assert.equal(calls.flatMap(([, args]) => args).includes('bootstrap'), false);
 });
 
@@ -422,6 +436,8 @@ function doctorFixture(overrides = {}) {
     sha256: daemon.managedCodexSha256,
     codeModeHostPath: '/opt/codex-code-mode-host',
     codeModeHostSha256: '00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6',
+    bwrapPath: '/opt/codex-resources/bwrap',
+    bwrapSha256: '77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c',
   };
   const config = overrides.config ?? {
     features: {
@@ -444,7 +460,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.3' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.4' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -487,7 +503,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.3', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.4', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -520,6 +536,21 @@ test('doctor certifies the exact held-call hooks and effective MCP config', asyn
   assert.equal(fixture.state.closed, true);
 });
 
+test('plain doctor output reports the exact pinned bubblewrap path and digest', () => {
+  const fixture = doctorFixture();
+  const output = formatDoctorOutput({
+    ok: true,
+    daemon: fixture.daemon,
+    runtime: fixture.runtime,
+    clockSource: 'system',
+    connected: true,
+    checks: [],
+  });
+  assert.equal(output.includes(`Bubblewrap: ${fixture.runtime.bwrapPath}\n`), true);
+  assert.equal(output.includes(`Bubblewrap SHA-256: ${fixture.runtime.bwrapSha256}\n`), true);
+  assert.equal(output.endsWith('\n'), true);
+});
+
 test('doctor fails before App Server work when the code-mode host is unavailable', async () => {
   const fixture = doctorFixture({
     verifyPinnedCodexRuntime: async () => {
@@ -534,6 +565,28 @@ test('doctor fails before App Server work when the code-mode host is unavailable
   assert.equal(
     result.checks.find((check) => check.id === 'codex_runtime').error,
     'CODE_MODE_HOST_MISSING',
+  );
+  assert.equal(
+    result.checks.find((check) => check.id === 'app_server').error,
+    'codex_runtime_unavailable',
+  );
+  assert.equal(fixture.state.closed, false);
+});
+
+test('doctor fails before App Server work when bubblewrap is unavailable', async () => {
+  const fixture = doctorFixture({
+    verifyPinnedCodexRuntime: async () => {
+      const error = new Error('Pinned Codex bubblewrap helper is missing');
+      error.code = 'BWRAP_MISSING';
+      throw error;
+    },
+  });
+  const result = await doctorCommand({}, fixture.dependencies);
+  assert.equal(result.ok, false);
+  assert.equal(result.runtime, null);
+  assert.equal(
+    result.checks.find((check) => check.id === 'codex_runtime').error,
+    'BWRAP_MISSING',
   );
   assert.equal(
     result.checks.find((check) => check.id === 'app_server').error,
@@ -802,7 +855,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.3', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.4', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);

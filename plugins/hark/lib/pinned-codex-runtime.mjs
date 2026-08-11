@@ -14,7 +14,7 @@ import {
   rm as nodeRmPromise,
 } from 'node:fs/promises';
 import { homedir as nodeHomedir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline as nodePipeline } from 'node:stream/promises';
 
@@ -43,6 +43,18 @@ export const PINNED_CODEX_RUNTIME = Object.freeze({
     'standalone',
     'current',
     'codex-code-mode-host',
+  ),
+  bwrapArchiveFilename: 'bwrap-x86_64-unknown-linux-musl.tar.gz',
+  bwrapExecutableFilename: 'bwrap-x86_64-unknown-linux-musl',
+  bwrapAssetUrl: 'https://github.com/openai/codex/releases/download/rust-v0.147.0/bwrap-x86_64-unknown-linux-musl.tar.gz',
+  bwrapArchiveSha256: 'e73dc46e2ec7176499cb14e26c7b80b9d8e24a39cd51fe8fa0d45ddd8f6fb87c',
+  bwrapExecutableSha256: '77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c',
+  managedBwrapRelativePath: join(
+    'packages',
+    'standalone',
+    'current',
+    'codex-resources',
+    'bwrap',
   ),
 });
 
@@ -76,6 +88,22 @@ const CODE_MODE_HOST_ARTIFACT = Object.freeze({
   targetNotExecutableCode: 'CODE_MODE_HOST_NOT_EXECUTABLE',
   targetChangedCode: 'CODE_MODE_HOST_CHANGED_DURING_VERIFICATION',
   targetMissingCode: 'CODE_MODE_HOST_MISSING',
+});
+
+const BWRAP_ARTIFACT = Object.freeze({
+  label: 'Codex bubblewrap helper',
+  archiveFilename: PINNED_CODEX_RUNTIME.bwrapArchiveFilename,
+  executableFilename: PINNED_CODEX_RUNTIME.bwrapExecutableFilename,
+  assetUrl: PINNED_CODEX_RUNTIME.bwrapAssetUrl,
+  archiveSha256: PINNED_CODEX_RUNTIME.bwrapArchiveSha256,
+  executableSha256: PINNED_CODEX_RUNTIME.bwrapExecutableSha256,
+  archiveMismatchCode: 'BWRAP_ARCHIVE_SHA256_MISMATCH',
+  executableMismatchCode: 'BWRAP_EXECUTABLE_SHA256_MISMATCH',
+  targetMismatchCode: 'BWRAP_TARGET_MISMATCH',
+  targetUnsafeCode: 'BWRAP_TARGET_UNSAFE',
+  targetNotExecutableCode: 'BWRAP_NOT_EXECUTABLE',
+  targetChangedCode: 'BWRAP_CHANGED_DURING_VERIFICATION',
+  targetMissingCode: 'BWRAP_MISSING',
 });
 
 export class PinnedCodexRuntimeError extends Error {
@@ -155,11 +183,46 @@ export function managedCodexCodeModeHostPath(codexHome) {
   );
 }
 
-export function siblingCodexCodeModeHostPath(codexPath) {
+export function managedCodexBwrapPath(codexHome) {
+  return join(
+    requireAbsoluteDirectory(codexHome, 'CODEX_HOME'),
+    PINNED_CODEX_RUNTIME.managedBwrapRelativePath,
+  );
+}
+
+function requireNormalizedCodexPath(codexPath) {
   if (typeof codexPath !== 'string' || codexPath.length === 0 || !isAbsolute(codexPath)) {
     fail('CODEX_EXECUTABLE_PATH_INVALID', 'Codex executable path must be absolute', { codexPath });
   }
-  return join(dirname(codexPath), 'codex-code-mode-host');
+  if (normalize(codexPath) !== codexPath) {
+    fail(
+      'CODEX_EXECUTABLE_PATH_NOT_NORMALIZED',
+      'Codex executable path must be lexically normalized',
+      { codexPath },
+    );
+  }
+  return codexPath;
+}
+
+export function siblingCodexBwrapPath(codexPath) {
+  const executableDirectory = dirname(requireNormalizedCodexPath(codexPath));
+  // Codex selects package resources only after recognizing a canonical
+  // codex-package.json layout. A basename-only guess could validate one helper
+  // while Codex executes another. Hark v0.1.4 certifies its own flat managed
+  // layout and rejects ambiguous bin/package layouts until their metadata is
+  // bound explicitly.
+  if (basename(executableDirectory) === 'bin') {
+    fail(
+      'CODEX_PACKAGE_LAYOUT_UNSUPPORTED',
+      'Codex package bin layouts are not certified by this Hark release',
+      { codexPath },
+    );
+  }
+  return join(executableDirectory, 'codex-resources', 'bwrap');
+}
+
+export function siblingCodexCodeModeHostPath(codexPath) {
+  return join(dirname(requireNormalizedCodexPath(codexPath)), 'codex-code-mode-host');
 }
 
 export async function sha256File(
@@ -498,6 +561,12 @@ async function installMissingArtifact({
     });
     await chmodImpl(extractedPath, 0o700);
     await mkdirImpl(targetDirectory, { recursive: true, mode: 0o700 });
+    const targetDirectoryStat = await lstatImpl(targetDirectory);
+    if (!targetDirectoryStat.isDirectory() || targetDirectoryStat.isSymbolicLink?.()) {
+      fail(artifact.targetUnsafeCode, `Managed ${artifact.label} directory is unsafe`, {
+        targetDirectory,
+      });
+    }
 
     try {
       await linkImpl(extractedPath, targetPath);
@@ -551,9 +620,11 @@ async function installMissingArtifact({
   return outcome;
 }
 
-function combinedInstallOutcome(codex, codeModeHost) {
+function combinedInstallOutcome(codex, codeModeHost, bwrap) {
   return {
-    status: codex.status === 'already_installed' && codeModeHost.status === 'already_installed'
+    status: codex.status === 'already_installed'
+      && codeModeHost.status === 'already_installed'
+      && bwrap.status === 'already_installed'
       ? 'already_installed'
       : 'installed',
     path: codex.path,
@@ -561,6 +632,8 @@ function combinedInstallOutcome(codex, codeModeHost) {
     sha256: codex.sha256,
     codeModeHostPath: codeModeHost.path,
     codeModeHostSha256: codeModeHost.sha256,
+    bwrapPath: bwrap.path,
+    bwrapSha256: bwrap.sha256,
   };
 }
 
@@ -580,6 +653,17 @@ export async function verifyPinnedCodexRuntime(codexPath, {
       codeModeHostPath,
     });
   }
+  const bwrapPath = siblingCodexBwrapPath(codexPath);
+  const bwrap = await inspectExistingTarget(
+    bwrapPath,
+    BWRAP_ARTIFACT,
+    { lstatImpl, verifyFileImpl, hashFileImpl },
+  );
+  if (!bwrap) {
+    fail(BWRAP_ARTIFACT.targetMissingCode, 'Pinned Codex bubblewrap helper is missing', {
+      bwrapPath,
+    });
+  }
   const codex = await inspectExistingTarget(codexPath, CODEX_ARTIFACT, {
     lstatImpl,
     verifyFileImpl,
@@ -588,7 +672,7 @@ export async function verifyPinnedCodexRuntime(codexPath, {
   if (!codex) {
     fail(CODEX_ARTIFACT.targetMissingCode, 'Pinned Codex executable is missing', { codexPath });
   }
-  return combinedInstallOutcome(codex, codeModeHost);
+  return combinedInstallOutcome(codex, codeModeHost, bwrap);
 }
 
 export async function installPinnedCodexRuntime({
@@ -621,6 +705,7 @@ export async function installPinnedCodexRuntime({
   const resolvedCodexHome = resolveCodexHome({ codexHome, env, homedirImpl });
   const codexPath = managedCodexPath(resolvedCodexHome);
   const codeModeHostPath = managedCodexCodeModeHostPath(resolvedCodexHome);
+  const bwrapPath = managedCodexBwrapPath(resolvedCodexHome);
   const inspectionDependencies = { lstatImpl, verifyFileImpl, hashFileImpl };
   const existingCodex = await inspectExistingTarget(
     codexPath,
@@ -632,8 +717,13 @@ export async function installPinnedCodexRuntime({
     CODE_MODE_HOST_ARTIFACT,
     inspectionDependencies,
   );
-  if (existingCodex && existingCodeModeHost) {
-    return combinedInstallOutcome(existingCodex, existingCodeModeHost);
+  const existingBwrap = await inspectExistingTarget(
+    bwrapPath,
+    BWRAP_ARTIFACT,
+    inspectionDependencies,
+  );
+  if (existingCodex && existingCodeModeHost && existingBwrap) {
+    return combinedInstallOutcome(existingCodex, existingCodeModeHost, existingBwrap);
   }
 
   const standaloneDirectory = join(resolvedCodexHome, 'packages', 'standalone');
@@ -653,12 +743,17 @@ export async function installPinnedCodexRuntime({
     rmImpl,
   };
 
-  // Install the tool host first. The Codex executable is the final readiness
-  // latch on a fresh install; an interrupted run is safely repairable.
+  // Install the tool host and sandbox helper first. The Codex executable is
+  // the final readiness latch on a fresh install; an interrupted run is repairable.
   const codeModeHost = existingCodeModeHost ?? await installMissingArtifact({
     ...installDependencies,
     artifact: CODE_MODE_HOST_ARTIFACT,
     targetPath: codeModeHostPath,
+  });
+  const bwrap = existingBwrap ?? await installMissingArtifact({
+    ...installDependencies,
+    artifact: BWRAP_ARTIFACT,
+    targetPath: bwrapPath,
   });
   const codex = existingCodex ?? await installMissingArtifact({
     ...installDependencies,
@@ -668,7 +763,9 @@ export async function installPinnedCodexRuntime({
   const verified = await verifyPinnedCodexRuntime(codexPath, inspectionDependencies);
   return {
     ...verified,
-    status: codex.status === 'installed' || codeModeHost.status === 'installed'
+    status: codex.status === 'installed'
+      || codeModeHost.status === 'installed'
+      || bwrap.status === 'installed'
       ? 'installed'
       : verified.status,
   };
