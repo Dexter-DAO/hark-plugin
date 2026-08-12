@@ -25,8 +25,8 @@ test('portable package targets one exact Agent Plugins v1 contract', async () =>
   );
   assert.equal(mcp.$schema, 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json');
   assert.equal(plugin.name, 'hark');
-  assert.equal(plugin.version, '0.1.9');
-  assert.equal(codex.version, '0.1.9');
+  assert.equal(plugin.version, '0.1.10');
+  assert.equal(codex.version, '0.1.10');
   assert.equal(plugin.repository, 'https://github.com/Dexter-DAO/hark-plugin');
   assert.equal(codex.repository, 'https://github.com/Dexter-DAO/hark-plugin');
   assert.match(plugin.description, /Requires a certified host adapter/);
@@ -34,7 +34,7 @@ test('portable package targets one exact Agent Plugins v1 contract', async () =>
   assert.deepEqual(Object.keys(mcp.mcpServers), ['hark']);
 });
 
-test('Hark 0.1.9 keeps the independently versioned Hermes adapter at 0.1.0', async () => {
+test('Hark 0.1.10 keeps the independently versioned Hermes adapter at 0.1.0', async () => {
   const repositoryRoot = path.resolve(codexRoot, '..');
   const [pluginYaml, pyproject, packageInit] = await Promise.all([
     readFile(path.join(repositoryRoot, 'packages/hermes-hark/plugin.yaml'), 'utf8'),
@@ -72,6 +72,7 @@ test('Codex wrapper points into one bundled portable Hark implementation', async
     assert.equal(path.resolve(codexRoot, relative).startsWith(`${codexRoot}${path.sep}`), true);
   }
   assert.deepEqual(mcp.mcpServers.hark.args, ['./hark/mcp/server.mjs']);
+  assert.deepEqual(mcp.mcpServers.hark.env_vars, ['CODEX_HOME', 'HARK_DATA_DIR']);
   assert.equal(mcp.mcpServers.hark.required, true);
   assert.equal(mcp.mcpServers.hark.supports_parallel_tool_calls, false);
   assert.deepEqual(mcp.mcpServers.hark.enabled_tools, ['hark_await']);

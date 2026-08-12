@@ -1067,6 +1067,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
         command: 'node',
         args: ['./hark/mcp/server.mjs'],
         cwd: '.',
+        env_vars: ['CODEX_HOME', 'HARK_DATA_DIR'],
         enabled: true,
         required: true,
         supports_parallel_tool_calls: false,

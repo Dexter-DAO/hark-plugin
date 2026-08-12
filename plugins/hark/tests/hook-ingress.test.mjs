@@ -913,4 +913,5 @@ test('Codex wrapper installs PreToolUse before PostToolUse for only hark_await',
   assert.match(hooks.hooks.UserPromptSubmit[0].hooks[0].command, /hooks\/prompt-guard\.mjs/);
   assert.equal(mcp.mcpServers.hark.cwd, '.');
   assert.deepEqual(mcp.mcpServers.hark.args, ['./hark/mcp/server.mjs']);
+  assert.deepEqual(mcp.mcpServers.hark.env_vars, ['CODEX_HOME', 'HARK_DATA_DIR']);
 });
