@@ -427,7 +427,11 @@ export class HeldCallCrashReconciler {
     } catch (error) {
       return pending(error, options.signal, 'cancel_reconciliation_pending');
     }
-    const cancelled = assertReconciledCancelApiResponse(rawCancel, armBinding.awaitId);
+    const cancelled = assertReconciledCancelApiResponse(rawCancel, {
+      awaitId: armBinding.awaitId,
+      armRequest: armAttempt.armRequest,
+      cancelRequest: transitionAuthority.decisionRequest,
+    });
     let terminal = initial.terminal;
     if (!terminal) {
       try {

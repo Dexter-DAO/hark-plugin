@@ -73,7 +73,7 @@ async function completeHandshake(client, transport) {
       clientInfo: {
         name: 'hark-codex-supervisor',
         title: 'Hark Codex Supervisor',
-        version: '0.1.5',
+        version: '0.1.6',
       },
       capabilities: { experimentalApi: true },
     },
@@ -179,6 +179,133 @@ test('reads the exact hook and MCP inventories used by Hark doctor', async () =>
     result: { data: [{ name: 'hark', tools: { hark_await: {} } }], nextCursor: null },
   });
   assert.deepEqual(Object.keys((await mcpPending).data[0].tools), ['hark_await']);
+  await client.close();
+});
+
+test('writes one config value through the exact pinned App Server request', async () => {
+  const transport = new FakeTransport();
+  const client = createClient(transport);
+  await completeHandshake(client, transport);
+
+  const writing = client.writeConfigValue({
+    keyPath: 'features.code_mode.direct_only_tool_namespaces',
+    value: ['mcp__existing', 'mcp__hark'],
+    mergeStrategy: 'replace',
+    filePath: '/tmp/codex-home/config.toml',
+    expectedVersion: 'sha256:before',
+  });
+  const request = await transport.nextMessage();
+  assert.deepEqual(request, {
+    method: 'config/value/write',
+    id: 2,
+    params: {
+      keyPath: 'features.code_mode.direct_only_tool_namespaces',
+      value: ['mcp__existing', 'mcp__hark'],
+      mergeStrategy: 'replace',
+      filePath: '/tmp/codex-home/config.toml',
+      expectedVersion: 'sha256:before',
+    },
+  });
+  transport.send({
+    id: request.id,
+    result: {
+      status: 'ok',
+      version: 'sha256:after',
+      filePath: '/tmp/codex-home/config.toml',
+      overriddenMetadata: null,
+    },
+  });
+  assert.deepEqual(await writing, {
+    status: 'ok',
+    version: 'sha256:after',
+    filePath: '/tmp/codex-home/config.toml',
+    overriddenMetadata: null,
+  });
+  await client.close();
+});
+
+test('rejects malformed or silently overridden config write responses', async () => {
+  for (const result of [
+    {
+      status: 'unexpected',
+      version: 'sha256:after',
+      filePath: '/tmp/codex-home/config.toml',
+      overriddenMetadata: null,
+    },
+    {
+      status: 'ok',
+      version: '',
+      filePath: '/tmp/codex-home/config.toml',
+      overriddenMetadata: null,
+    },
+    {
+      status: 'ok',
+      version: 'sha256:after',
+      filePath: '/tmp/other/config.toml',
+      overriddenMetadata: null,
+    },
+    {
+      status: 'ok',
+      version: 'sha256:after',
+      filePath: '/tmp/codex-home/config.toml',
+    },
+    {
+      status: 'okOverridden',
+      version: 'sha256:after',
+      filePath: '/tmp/codex-home/config.toml',
+      overriddenMetadata: {
+        message: 'managed setting wins',
+        overridingLayer: {
+          name: { type: 'system', file: '/etc/codex/config.toml' },
+          version: 'sha256:managed',
+        },
+        effectiveValue: ['mcp__managed'],
+      },
+    },
+  ]) {
+    const transport = new FakeTransport();
+    const client = createClient(transport);
+    await completeHandshake(client, transport);
+    const writing = client.writeConfigValue({
+      keyPath: 'features.code_mode.direct_only_tool_namespaces',
+      value: ['mcp__hark'],
+      mergeStrategy: 'replace',
+      expectedVersion: 'sha256:before',
+    });
+    const request = await transport.nextMessage();
+    transport.send({ id: request.id, result });
+    await assert.rejects(writing, AppServerProtocolError);
+    await client.close();
+  }
+});
+
+test('returns a validated overridden config write only when explicitly allowed', async () => {
+  const transport = new FakeTransport();
+  const client = createClient(transport);
+  await completeHandshake(client, transport);
+
+  const writing = client.writeConfigValue({
+    keyPath: 'features.code_mode.direct_only_tool_namespaces',
+    value: ['mcp__hark'],
+    mergeStrategy: 'replace',
+    expectedVersion: 'sha256:before',
+  }, { allowOverridden: true });
+  const request = await transport.nextMessage();
+  const result = {
+    status: 'okOverridden',
+    version: 'sha256:after',
+    filePath: '/tmp/codex-home/config.toml',
+    overriddenMetadata: {
+      message: 'managed setting wins',
+      overridingLayer: {
+        name: { type: 'system', file: '/etc/codex/config.toml' },
+        version: 'sha256:managed',
+      },
+      effectiveValue: ['mcp__managed'],
+    },
+  };
+  transport.send({ id: request.id, result });
+  assert.deepEqual(await writing, result);
   await client.close();
 });
 

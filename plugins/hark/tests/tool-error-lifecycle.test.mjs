@@ -11,7 +11,9 @@ import {
 import { sha256Canonical } from '../lib/canonical.mjs';
 import {
   assertReconciledArmApiResponse,
+  assertReconciledCancelApiResponse,
   assertReconciledCommitApiResponse,
+  createHeldCallCancelRequest,
   HarkToolErrorLifecycle,
 } from '../lib/tool-error-lifecycle.mjs';
 import { HarkToolWaitProtocol } from '../lib/tool-wait-protocol.mjs';
@@ -136,15 +138,31 @@ function lifecycleOptions(protocol, serviceClient = {}) {
   };
 }
 
-function cancelResponse(replay = false) {
+function cancelResponse(armRequest, replay = false) {
+  const cancelledAt = '2026-08-07T12:00:01.000Z';
+  const awaitView = armApiResponse(armRequest).await;
   return {
     v: 'hark.await-cancel-result.v2',
     await: {
-      id: 'await-1',
+      ...awaitView,
+      waiter: {
+        ...awaitView.waiter,
+        releasedAt: cancelledAt,
+      },
       state: 'cancelled',
-      cancelledAt: '2026-08-07T12:00:01.000Z',
+      cancelledAt,
+      lastError: 'codex_held_tool_failed_before_suspension',
+      updatedAt: cancelledAt,
     },
     replay,
+  };
+}
+
+function cancelExpectation(value) {
+  return {
+    awaitId: 'await-1',
+    armRequest: value.armRequest,
+    cancelRequest: createHeldCallCancelRequest(value.request),
   };
 }
 
@@ -192,6 +210,62 @@ test('reconciliation accepts fresh or replayed exact API effects and rejects ide
     () => assertReconciledArmApiResponse(altered, value.armRequest),
     /armed_await_origin_mismatch/,
   );
+});
+
+test('reconciled cancellation accepts the exact production-shaped await for replay and non-replay', async () => {
+  const value = await fixture();
+  for (const replay of [false, true]) {
+    const response = cancelResponse(value.armRequest, replay);
+    assert.equal(
+      assertReconciledCancelApiResponse(response, cancelExpectation(value)).replay,
+      replay,
+    );
+  }
+});
+
+test('reconciled cancellation rejects incomplete, extra, or inconsistent production shapes', async (context) => {
+  const value = await fixture();
+  const cases = [
+    ['missing public Await field', (response) => { delete response.await.prepared; }, /cancelled_await_field_required:prepared/],
+    ['extra public Await field', (response) => { response.await.extra = true; }, /cancelled_await_field_unsupported:extra/],
+    ['wrong public Await version', (response) => { response.await.v = 'hark.await.v1'; }, /cancelled_await_version_invalid/],
+    ['wrong Await identity', (response) => { response.await.id = 'other-await'; }, /cancel_result_state_mismatch/],
+    ['wrong preparation nonce', (response) => { response.await.preparationNonce = 'other'; }, /cancelled_await_preparation_nonce_mismatch/],
+    ['wrong origin', (response) => { response.await.origin.taskId = 'other'; }, /cancelled_await_origin_mismatch/],
+    ['wrong checkpoint', (response) => { response.await.checkpoint.digest = '9'.repeat(64); }, /cancelled_await_checkpoint_mismatch/],
+    ['wrong binding', (response) => { response.await.binding.toolUseId = 'other'; }, /cancelled_await_binding_mismatch/],
+    ['wrong prepared payload', (response) => { response.await.prepared.name = 'other'; }, /cancelled_await_prepared_mismatch/],
+    ['wrong predicate', (response) => { response.await.predicate.subject = 'other'; }, /cancelled_await_predicate_mismatch/],
+    ['wrong wake policy', (response) => { response.await.wakePolicy = 'other'; }, /cancelled_await_wake_policy_mismatch/],
+    ['wrong cancellation reason', (response) => { response.await.lastError = 'other'; }, /cancelled_await_last_error_mismatch/],
+    ['malformed waiter', (response) => { response.await.waiter.leaseGeneration = 0; }, /cancelled_await_waiter_generation_invalid/],
+    ['wrong Await state', (response) => { response.await.state = 'armed'; }, /cancel_result_state_mismatch/],
+    ['missing cancellation timestamp', (response) => { response.await.cancelledAt = null; }, /cancelled_await_cancelledAt_invalid/],
+    ['invalid cancellation timestamp', (response) => { response.await.cancelledAt = '2026-08-07T12:00:01Z'; }, /cancelled_await_cancelledAt_invalid/],
+    ['cancellation before creation', (response) => {
+      response.await.createdAt = '2026-08-07T12:00:02.000Z';
+    }, /cancelled_await_lifecycle_order_invalid/],
+    ['updated timestamp differs from cancellation', (response) => {
+      response.await.updatedAt = '2026-08-07T12:00:02.000Z';
+    }, /cancelled_await_updated_at_mismatch/],
+    ['waiter release differs from cancellation', (response) => {
+      response.await.waiter.releasedAt = '2026-08-07T12:00:02.000Z';
+    }, /cancelled_await_waiter_release_mismatch/],
+    ['committed lifecycle timestamp present', (response) => {
+      response.await.suspendedAt = '2026-08-07T12:00:00.500Z';
+    }, /cancelled_await_lifecycle_conflict/],
+    ['nonboolean replay', (response) => { response.replay = 'false'; }, /cancel_result_replay_invalid/],
+  ];
+  for (const [name, mutate, expected] of cases) {
+    await context.test(name, () => {
+      const response = cancelResponse(value.armRequest);
+      mutate(response);
+      assert.throws(
+        () => assertReconciledCancelApiResponse(response, cancelExpectation(value)),
+        expected,
+      );
+    });
+  }
 });
 
 test('deterministic pre-arm failure releases only after exact host error observation', async () => {
@@ -248,7 +322,7 @@ test('ambiguous arm stays owned until exact replay and authoritative cancel', as
     },
     async cancelAwait(awaitId, body) {
       calls.push(['cancel', awaitId, structuredClone(body)]);
-      return cancelResponse();
+      return cancelResponse(value.armRequest);
     },
   };
   const lifecycle = new HarkToolErrorLifecycle({
@@ -291,7 +365,7 @@ test('post-arm replay state never authorizes a local bind or cancellation', asyn
         },
         async cancelAwait() {
           cancelCalls += 1;
-          return cancelResponse();
+          return cancelResponse(value.armRequest);
         },
       };
       const lifecycle = new HarkToolErrorLifecycle({
@@ -343,7 +417,7 @@ test('altered local arm closure blocks tool-error cancellation before the API', 
         ...lifecycleOptions(value.protocol, {
           async cancelAwait() {
             cancelCalls += 1;
-            return cancelResponse();
+            return cancelResponse(value.armRequest);
           },
         }),
       });
@@ -369,7 +443,7 @@ test('confirmed arm and precommit error does not release before cancel acknowled
       async cancelAwait() {
         cancelCalls += 1;
         if (cancelCalls === 1) throw Object.assign(new Error('unavailable'), { status: 503 });
-        return cancelResponse(true);
+        return cancelResponse(value.armRequest, true);
       },
     }),
   });

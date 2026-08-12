@@ -17,7 +17,7 @@ are never model inputs. The parent package includes the Codex adapter.
 Add this repository as a Codex plugin marketplace and install **Hark**:
 
 ```bash
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.5
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.6
 codex plugin add hark@hark
 ```
 
@@ -28,6 +28,10 @@ the installed plugin root:
 ```bash
 node ./hark/cli/hark-codex.mjs setup --no-open
 ```
+
+Setup preserves existing `features.code_mode.direct_only_tool_namespaces`
+entries and ensures `mcp__hark` is exposed directly. Doctor fails closed when
+that direct exposure is absent.
 
 Hark setup pins and verifies the Codex 0.147 executable, its required
 `codex-code-mode-host` sibling, and the official bundled Bubblewrap helper used

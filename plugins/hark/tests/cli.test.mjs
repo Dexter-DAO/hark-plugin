@@ -10,6 +10,7 @@ import {
   connectCommand,
   createSupervisorRuntime,
   doctorCommand,
+  ensureHarkDirectToolNamespace,
   ensureCommand,
   formatDoctorOutput,
   formatDeviceVerification,
@@ -18,6 +19,7 @@ import {
   parseArgs,
   runProcess,
   verifyCodexSandbox,
+  verifyHarkDirectToolNamespace,
   wait,
 } from '../cli/hark-codex.mjs';
 import { HarkCredentialsStore } from '../lib/credentials.mjs';
@@ -75,6 +77,160 @@ test('process runner returns bounded structured failures and enforces its timeou
   });
 });
 
+function configClientFactory(fixtures, calls = []) {
+  const queue = [...fixtures];
+  return {
+    calls,
+    factory({ command }) {
+      const fixture = queue.shift();
+      assert.ok(fixture, 'unexpected config client construction');
+      return {
+        async start() {
+          calls.push(['start', command]);
+          return { codexHome: fixture.codexHome ?? '/tmp/codex-home' };
+        },
+        async readConfig(input) {
+          calls.push(['readConfig', input]);
+          return fixture.read;
+        },
+        async writeConfigValue(input) {
+          calls.push(['writeConfigValue', input]);
+          return fixture.writeResult;
+        },
+        async close() { calls.push(['close']); },
+      };
+    },
+  };
+}
+
+test('Codex direct-tool namespace verification fails closed on missing or malformed config', async () => {
+  const ready = configClientFactory([{ read: {
+    config: { features: { code_mode: { direct_only_tool_namespaces: ['other', 'mcp__hark'] } } },
+  } }]);
+  assert.deepEqual(await verifyHarkDirectToolNamespace('/opt/codex-0.147.0', {
+    configAppServerClientFactory: ready.factory,
+  }), { namespace: 'mcp__hark', namespaces: ['other', 'mcp__hark'] });
+
+  const missing = configClientFactory([{ read: { config: { features: {} } } }]);
+  await assert.rejects(
+    verifyHarkDirectToolNamespace('/opt/codex-0.147.0', {
+      configAppServerClientFactory: missing.factory,
+    }),
+    (error) => error?.code === 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING',
+  );
+
+  const malformed = configClientFactory([{ read: {
+    config: { features: { code_mode: { direct_only_tool_namespaces: ['mcp__hark', 7] } } },
+  } }]);
+  await assert.rejects(
+    verifyHarkDirectToolNamespace('/opt/codex-0.147.0', {
+      configAppServerClientFactory: malformed.factory,
+    }),
+    (error) => error?.code === 'CODEX_DIRECT_TOOL_NAMESPACES_INVALID',
+  );
+});
+
+test('setup atomically merges Hark into the version-bound user config and verifies readback', async () => {
+  const configPath = '/tmp/codex-home/config.toml';
+  const clients = configClientFactory([
+    {
+      read: {
+        config: {
+          features: { code_mode: { direct_only_tool_namespaces: ['mcp__other'] } },
+        },
+        layers: [{
+          name: { type: 'user', file: configPath, profile: null },
+          version: 'sha256:before',
+          config: { features: {} },
+        }],
+      },
+      writeResult: {
+        filePath: configPath, status: 'ok', version: 'sha256:after', overriddenMetadata: null,
+      },
+    },
+    {
+      read: {
+        config: {
+          features: {
+            code_mode: { direct_only_tool_namespaces: ['mcp__other', 'mcp__hark'] },
+          },
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(await ensureHarkDirectToolNamespace('/opt/codex-0.147.0', {
+    configAppServerClientFactory: clients.factory,
+    cwd: '/workspace',
+  }), {
+    changed: true,
+    namespace: 'mcp__hark',
+    namespaces: ['mcp__other', 'mcp__hark'],
+  });
+  assert.deepEqual(clients.calls.find(([name]) => name === 'writeConfigValue'), [
+    'writeConfigValue',
+    {
+      keyPath: 'features.code_mode.direct_only_tool_namespaces',
+      value: ['mcp__other', 'mcp__hark'],
+      mergeStrategy: 'replace',
+      expectedVersion: 'sha256:before',
+      filePath: configPath,
+    },
+  ]);
+});
+
+test('setup fails closed if readback loses a preserved direct-tool namespace', async () => {
+  const configPath = '/tmp/codex-home/config.toml';
+  const clients = configClientFactory([
+    {
+      read: {
+        config: {
+          features: { code_mode: { direct_only_tool_namespaces: ['mcp__other'] } },
+        },
+        layers: [{
+          name: { type: 'user', file: configPath, profile: null },
+          version: 'sha256:before',
+          config: { features: {} },
+        }],
+      },
+      writeResult: {
+        filePath: configPath, status: 'ok', version: 'sha256:after', overriddenMetadata: null,
+      },
+    },
+    {
+      read: {
+        config: {
+          features: { code_mode: { direct_only_tool_namespaces: ['mcp__hark'] } },
+        },
+      },
+    },
+  ]);
+
+  await assert.rejects(
+    ensureHarkDirectToolNamespace('/opt/codex-0.147.0', {
+      configAppServerClientFactory: clients.factory,
+      cwd: '/workspace',
+    }),
+    /codex_direct_tool_namespaces_readback_mismatch/,
+  );
+  assert.deepEqual(clients.calls.find(([name]) => name === 'writeConfigValue')?.[1]?.value, [
+    'mcp__other',
+    'mcp__hark',
+  ]);
+});
+
+test('setup leaves an already-correct direct-tool namespace untouched', async () => {
+  const clients = configClientFactory([{ read: {
+    config: { features: { code_mode: { direct_only_tool_namespaces: ['mcp__hark'] } } },
+    layers: [],
+  } }]);
+  assert.deepEqual(await ensureHarkDirectToolNamespace('/opt/codex-0.147.0', {
+    configAppServerClientFactory: clients.factory,
+  }), {
+    changed: false, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+  });
+  assert.equal(clients.calls.some(([name]) => name === 'writeConfigValue'), false);
+});
+
 test('setup verifies the pinned binary before non-updating daemon lifecycle mutations', async () => {
   const calls = [];
   const verified = [];
@@ -95,6 +251,9 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
         ? { stdout: 'codex-cli 0.147.0\n', stderr: '' }
         : { stdout: '', stderr: '' };
     },
+    ensureHarkDirectToolNamespace: async () => ({
+      changed: false, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+    }),
     daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
   });
   assert.deepEqual(verified, ['/opt/codex-0.147.0']);
@@ -119,6 +278,34 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
     status: 'ready', backend: 'bubblewrap',
     permissionProfiles: [':read-only', ':workspace'],
   });
+});
+
+test('setup restarts the daemon after adding the direct Hark namespace', async () => {
+  const calls = [];
+  await bootstrapDaemonCommand({ codex: '/opt/codex-0.147.0' }, {
+    verifyPinnedCodexRuntime: async (command) => ({
+      path: command,
+      codeModeHostPath: '/opt/codex-code-mode-host',
+      codeModeHostSha256: 'host-sha256',
+      bwrapPath: '/opt/codex-resources/bwrap',
+      bwrapSha256: 'bwrap-sha256',
+    }),
+    ensureHarkDirectToolNamespace: async () => ({
+      changed: true, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+    }),
+    runProcess: async (command, args) => {
+      calls.push([command, args]);
+      return args[0] === '--version'
+        ? { stdout: 'codex-cli 0.147.0\n', stderr: '' }
+        : { stdout: '', stderr: '' };
+    },
+    daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
+  });
+  assert.deepEqual(calls.slice(-3), [
+    ['/opt/codex-0.147.0', ['app-server', 'daemon', 'enable-remote-control']],
+    ['/opt/codex-0.147.0', ['app-server', 'daemon', 'start']],
+    ['/opt/codex-0.147.0', ['app-server', 'daemon', 'restart']],
+  ]);
 });
 
 test('sandbox verification forces modern bubblewrap for both certified permission profiles', async () => {
@@ -273,6 +460,9 @@ test('setup installs and reuses the managed pinned runtime without launching an 
         ? { stdout: 'codex-cli 0.147.0\n', stderr: '' }
         : { stdout: '', stderr: '' };
     },
+    ensureHarkDirectToolNamespace: async () => ({
+      changed: false, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+    }),
     daemonTransport: {
       async inspect() {
         return {
@@ -353,6 +543,7 @@ test('constructs the supervisor only when credentials match the private runtime 
     appServerClient,
     serviceClient,
     verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
+    verifyHarkDirectToolNamespace: async () => ({ namespace: 'mcp__hark' }),
   });
   assert.equal(runtime.credentials.installation.runtimeId, 'runtime-1');
   assert.equal(runtime.supervisor.credentialsStore, credentialsStore);
@@ -390,6 +581,27 @@ test('refuses supervisor construction when the pinned runtime tuple is incomplet
   }), (error) => error?.code === 'CODE_MODE_HOST_MISSING');
 });
 
+test('refuses supervisor construction when Hark is not exposed as a direct tool', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-cli-'));
+  const journal = new HarkJournal(directory);
+  const credentialsStore = new HarkCredentialsStore(directory);
+  await journal.ensureRuntimeId(() => 'runtime-1');
+  await credentialsStore.save({
+    apiBaseUrl: 'https://api.example.test', accessToken: 'hki_secret',
+    installation: { id: 'installation-1', protocol: 'codex', runtimeId: 'runtime-1' },
+  });
+  await assert.rejects(createSupervisorRuntime({}, {
+    journal,
+    credentialsStore,
+    verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
+    verifyHarkDirectToolNamespace: async () => {
+      const error = new Error('codex_hark_direct_tool_namespace_missing');
+      error.code = 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING';
+      throw error;
+    },
+  }), (error) => error?.code === 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING');
+});
+
 test('ensure is a no-op before connection and starts one detached supervisor when ready', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-cli-'));
   const credentialsStore = new HarkCredentialsStore(directory);
@@ -406,6 +618,7 @@ test('ensure is a no-op before connection and starts one detached supervisor whe
     dataDir: directory,
     credentialsStore,
     verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
+    verifyHarkDirectToolNamespace: async () => ({ namespace: 'mcp__hark' }),
     processLock: { inspect: async () => null },
     daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
     waitForSupervisorReady: async () => ({ pid: 1234 }),
@@ -448,6 +661,37 @@ test('ensure checks the full runtime tuple before accepting an existing supervis
     },
   });
   assert.deepEqual(result, { started: false, reason: 'CODE_MODE_HOST_MISSING' });
+  assert.equal(lockInspections, 0);
+});
+
+test('ensure rejects an existing supervisor until setup repairs direct Hark exposure', async () => {
+  const credentialsStore = {
+    async read() {
+      return {
+        apiBaseUrl: 'https://api.example.test', accessToken: 'hki_secret',
+        installation: { id: 'installation-1', protocol: 'codex', runtimeId: 'runtime-1' },
+      };
+    },
+  };
+  let lockInspections = 0;
+  const result = await ensureCommand({ codex: '/opt/codex-0.147.0' }, {
+    credentialsStore,
+    verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
+    verifyHarkDirectToolNamespace: async () => {
+      const error = new Error('codex_hark_direct_tool_namespace_missing');
+      error.code = 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING';
+      throw error;
+    },
+    processLock: {
+      async inspect() {
+        lockInspections += 1;
+        return { alive: true, pid: 1234 };
+      },
+    },
+  });
+  assert.deepEqual(result, {
+    started: false, reason: 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING',
+  });
   assert.equal(lockInspections, 0);
 });
 
@@ -564,6 +808,7 @@ function doctorFixture(overrides = {}) {
   const config = overrides.config ?? {
     features: {
       current_time_reminder: { clock_source: overrides.clockSource ?? 'system' },
+      code_mode: { direct_only_tool_namespaces: ['mcp__hark'] },
     },
     mcp_servers: {},
   };
@@ -582,7 +827,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.5' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.6' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -635,7 +880,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.5', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.6', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -654,13 +899,14 @@ test('doctor certifies the exact held-call hooks and effective MCP config', asyn
   const result = await doctorCommand({}, fixture.dependencies);
   assert.equal(result.ok, true);
   assert.equal(result.clockSource, 'system');
+  assert.equal(result.directToolNamespace, 'mcp__hark');
   assert.equal(result.daemon.managedCodexSha256, fixture.daemon.managedCodexSha256);
   assert.deepEqual(result.runtime, fixture.runtime);
   assert.deepEqual(result.sandbox, {
     status: 'ready', backend: 'bubblewrap',
     permissionProfiles: [':read-only', ':workspace'],
   });
-  assert.equal(result.checks.length, 13);
+  assert.equal(result.checks.length, 14);
   assert.deepEqual(result.checks.find((check) => check.id === 'hooks').detail, [
     'PostToolUse', 'PreToolUse', 'SessionStart', 'UserPromptSubmit',
   ]);
@@ -683,6 +929,7 @@ test('plain doctor output distinguishes the bundled fallback from functional san
       permissionProfiles: [':read-only', ':workspace'],
     },
     clockSource: 'system',
+    directToolNamespace: 'mcp__hark',
     connected: true,
     checks: [],
   });
@@ -692,7 +939,24 @@ test('plain doctor output distinguishes the bundled fallback from functional san
   ), true);
   assert.equal(output.includes('Sandbox execution: ready (bubblewrap)\n'), true);
   assert.equal(output.includes('Sandbox profiles: :read-only, :workspace\n'), true);
+  assert.equal(output.includes('Hark tool exposure: mcp__hark\n'), true);
   assert.equal(output.endsWith('\n'), true);
+});
+
+test('doctor fails closed when the effective config does not expose Hark directly', async () => {
+  const fixture = doctorFixture({
+    config: {
+      features: { current_time_reminder: { clock_source: 'system' } },
+      mcp_servers: {},
+    },
+  });
+  const result = await doctorCommand({}, fixture.dependencies);
+  assert.equal(result.ok, false);
+  assert.equal(result.directToolNamespace, null);
+  assert.equal(
+    result.checks.find((check) => check.id === 'direct_tool_namespace').error,
+    'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING',
+  );
 });
 
 test('doctor fails before App Server work when the code-mode host is unavailable', async () => {
@@ -1026,7 +1290,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.5', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.6', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);

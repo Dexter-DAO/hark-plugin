@@ -239,7 +239,7 @@ export function assertArmApiResponse(value, armRequest, options = {}) {
   }
   const createdAt = timestamp(armed.createdAt, 'armed_await_created_at');
   const updatedAt = timestamp(armed.updatedAt, 'armed_await_updated_at');
-  if (Date.parse(armed.armedAt) < Date.parse(createdAt)) {
+  if (Date.parse(armed.armedAt) > Date.parse(createdAt)) {
     throw new Error('armed_await_armed_at_order_invalid');
   }
   if (Date.parse(updatedAt) < Date.parse(createdAt)) {

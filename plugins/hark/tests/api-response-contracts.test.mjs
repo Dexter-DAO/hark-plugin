@@ -91,6 +91,47 @@ test('accepts a strict replayed arm after lifecycle progress', () => {
   );
 });
 
+test('accepts armedAt before or equal to createdAt and rejects armedAt after createdAt', async (context) => {
+  await context.test('armedAt before createdAt', () => {
+    const value = armApiResponse(ARM_REQUEST);
+    value.await.createdAt = '2026-08-07T12:00:00.005Z';
+    value.await.updatedAt = '2026-08-07T12:00:00.005Z';
+    assert.equal(
+      assertArmApiResponse(value, ARM_REQUEST, { expectedReplay: false }).armed.armedAt,
+      '2026-08-07T12:00:00.000Z',
+    );
+  });
+
+  await context.test('armedAt equal to createdAt', () => {
+    const value = armApiResponse(ARM_REQUEST);
+    assert.equal(
+      assertArmApiResponse(value, ARM_REQUEST, { expectedReplay: false }).armed.armedAt,
+      value.await.createdAt,
+    );
+  });
+
+  await context.test('armedAt after createdAt', () => {
+    const value = armApiResponse(ARM_REQUEST);
+    value.await.createdAt = '2026-08-07T12:00:00.005Z';
+    value.await.armedAt = '2026-08-07T12:00:00.006Z';
+    value.await.updatedAt = '2026-08-07T12:00:00.006Z';
+    assert.throws(
+      () => assertArmApiResponse(value, ARM_REQUEST, { expectedReplay: false }),
+      /armed_await_armed_at_order_invalid/,
+    );
+  });
+});
+
+test('continues to reject updatedAt before createdAt', () => {
+  const value = armApiResponse(ARM_REQUEST);
+  value.await.createdAt = '2026-08-07T12:00:00.005Z';
+  value.await.updatedAt = '2026-08-07T12:00:00.004Z';
+  assert.throws(
+    () => assertArmApiResponse(value, ARM_REQUEST, { expectedReplay: false }),
+    /armed_await_updated_at_order_invalid/,
+  );
+});
+
 test('rejects arm responses with any incomplete, unbound, or malformed field', async (context) => {
   const cases = [
     ['extra top-level field', (value) => { value.extra = true; }, /arm_result_field_unsupported:extra/],

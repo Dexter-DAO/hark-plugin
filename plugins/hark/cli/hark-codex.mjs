@@ -237,6 +237,133 @@ function configuredCodexCommand(options = {}, dependencies = {}) {
     ?? managedCodexPath(codexHome(options, dependencies));
 }
 
+const HARK_DIRECT_TOOL_NAMESPACE = 'mcp__hark';
+const HARK_DIRECT_TOOL_NAMESPACE_KEY = 'features.code_mode.direct_only_tool_namespaces';
+
+function directOnlyToolNamespaces(config, { requireHark = false } = {}) {
+  const namespaces = config?.features?.code_mode?.direct_only_tool_namespaces;
+  if (namespaces === undefined) {
+    if (requireHark) {
+      const error = new Error('codex_hark_direct_tool_namespace_missing');
+      error.code = 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING';
+      throw error;
+    }
+    return [];
+  }
+  if (
+    !Array.isArray(namespaces)
+    || namespaces.some((value) => typeof value !== 'string' || !value || value !== value.trim())
+    || new Set(namespaces).size !== namespaces.length
+  ) {
+    const error = new Error('codex_direct_tool_namespaces_invalid');
+    error.code = 'CODEX_DIRECT_TOOL_NAMESPACES_INVALID';
+    throw error;
+  }
+  if (requireHark && !namespaces.includes(HARK_DIRECT_TOOL_NAMESPACE)) {
+    const error = new Error('codex_hark_direct_tool_namespace_missing');
+    error.code = 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING';
+    throw error;
+  }
+  return namespaces;
+}
+
+function configClient(command, dependencies = {}) {
+  const factory = dependencies.configAppServerClientFactory;
+  if (typeof factory === 'function') return factory({ command });
+  return new AppServerClient({
+    command,
+    cwd: dependencies.cwd,
+    env: dependencies.env ?? process.env,
+  });
+}
+
+async function readCodexConfig(command, dependencies = {}, { includeLayers = false } = {}) {
+  const client = configClient(command, dependencies);
+  try {
+    const initialized = await client.start();
+    const result = await client.readConfig({
+      cwd: dependencies.cwd ?? process.cwd(),
+      includeLayers,
+    });
+    return { initialized, result };
+  } finally {
+    try {
+      await client.close?.();
+    } catch {
+      // The read result remains authoritative; shutdown is best-effort.
+    }
+  }
+}
+
+export async function verifyHarkDirectToolNamespace(command, dependencies = {}) {
+  const { result } = await readCodexConfig(command, dependencies);
+  const namespaces = directOnlyToolNamespaces(result.config, { requireHark: true });
+  return { namespace: HARK_DIRECT_TOOL_NAMESPACE, namespaces };
+}
+
+export async function ensureHarkDirectToolNamespace(command, dependencies = {}) {
+  const client = configClient(command, dependencies);
+  let changed = false;
+  let namespaces;
+  try {
+    const initialized = await client.start();
+    const result = await client.readConfig({
+      cwd: dependencies.cwd ?? process.cwd(),
+      includeLayers: true,
+    });
+    namespaces = directOnlyToolNamespaces(result.config);
+    if (!namespaces.includes(HARK_DIRECT_TOOL_NAMESPACE)) {
+      if (!Array.isArray(result.layers)) throw new Error('codex_config_layers_unverifiable');
+      const expectedConfigPath = path.join(initialized.codexHome, 'config.toml');
+      const userLayers = result.layers.filter((layer) => (
+        layer?.name?.type === 'user'
+        && layer.name.profile == null
+        && layer.name.file === expectedConfigPath
+      ));
+      if (userLayers.length !== 1 || typeof userLayers[0].version !== 'string') {
+        throw new Error('codex_user_config_layer_unverifiable');
+      }
+      if (typeof client.writeConfigValue !== 'function') {
+        throw new Error('codex_config_write_unavailable');
+      }
+      const userNamespaces = directOnlyToolNamespaces(userLayers[0].config);
+      const merged = [...new Set([
+        ...userNamespaces,
+        ...namespaces,
+        HARK_DIRECT_TOOL_NAMESPACE,
+      ])];
+      const response = await client.writeConfigValue({
+        keyPath: HARK_DIRECT_TOOL_NAMESPACE_KEY,
+        value: merged,
+        mergeStrategy: 'replace',
+        expectedVersion: userLayers[0].version,
+        filePath: expectedConfigPath,
+      });
+      if (response.filePath !== expectedConfigPath || response.status !== 'ok') {
+        throw new Error(`codex_config_write_not_effective:${response.status ?? 'unknown'}`);
+      }
+      namespaces = merged;
+      changed = true;
+    }
+  } finally {
+    try {
+      await client.close?.();
+    } catch {
+      // The writer/readback gates above remain authoritative.
+    }
+  }
+  if (changed) {
+    const verified = await verifyHarkDirectToolNamespace(command, dependencies);
+    if (
+      verified.namespaces.length !== namespaces.length
+      || verified.namespaces.some((value, index) => value !== namespaces[index])
+    ) {
+      throw new Error('codex_direct_tool_namespaces_readback_mismatch');
+    }
+  }
+  return { changed, namespace: HARK_DIRECT_TOOL_NAMESPACE, namespaces };
+}
+
 const CODEX_SANDBOX_PERMISSION_PROFILES = Object.freeze([':read-only', ':workspace']);
 const CODEX_SANDBOX_TIMEOUT_MS = 5_000;
 const BWRAP_USER_NAMESPACE_FAILURES = Object.freeze([
@@ -305,6 +432,10 @@ export async function createSupervisorRuntime(options = {}, dependencies = {}) {
   if (runtimeId !== credentials.installation.runtimeId) throw new Error('installation_runtime_mismatch');
   const command = configuredCodexCommand(options, dependencies);
   await (dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime)(command);
+  await (dependencies.verifyHarkDirectToolNamespace ?? verifyHarkDirectToolNamespace)(
+    command,
+    dependencies,
+  );
   const transportFactory = dependencies.transportFactory
     ?? createCodexDaemonTransportFactory({ command });
   const appServerClientFactory = dependencies.appServerClientFactory
@@ -430,11 +561,17 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
   const sandbox = await (dependencies.verifyCodexSandbox ?? verifyCodexSandbox)(command, {
     runProcess: execute,
   });
+  const directToolNamespace = await (
+    dependencies.ensureHarkDirectToolNamespace ?? ensureHarkDirectToolNamespace
+  )(command, dependencies);
   // `bootstrap` launches Codex's detached auto-updater, which would silently
   // replace the certified runtime. Hark deliberately enables the setting and
   // starts the daemon through the two non-updating lifecycle commands.
   await execute(command, ['app-server', 'daemon', 'enable-remote-control']);
   await execute(command, ['app-server', 'daemon', 'start']);
+  if (directToolNamespace.changed) {
+    await execute(command, ['app-server', 'daemon', 'restart']);
+  }
   const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
   const inspection = await daemon.inspect();
   if (inspection.managedCodexPath && inspection.managedCodexPath !== command) {
@@ -448,6 +585,7 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
     bwrapPath: runtime.bwrapPath,
     bwrapSha256: runtime.bwrapSha256,
     sandbox,
+    directToolNamespace,
   };
 }
 
@@ -459,6 +597,10 @@ export async function ensureCommand(options = {}, dependencies = {}) {
   const command = configuredCodexCommand(options, dependencies);
   try {
     await (dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime)(command);
+    await (dependencies.verifyHarkDirectToolNamespace ?? verifyHarkDirectToolNamespace)(
+      command,
+      dependencies,
+    );
   } catch (error) {
     return { started: false, reason: error?.code ?? 'runtime_incomplete' };
   }
@@ -657,6 +799,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
   }
 
   let clockSource = null;
+  let directToolNamespace = null;
   if (appServerReady) {
     let effectiveConfigPromise = null;
     const readEffectiveConfig = () => {
@@ -686,6 +829,13 @@ export async function doctorCommand(options = {}, dependencies = {}) {
       if (clockSource !== 'system') throw new Error(`codex_clock_source_unsupported:${clockSource}`);
       return clockSource;
     }, 'Use the Codex system clock source for certified Hark wakes.');
+
+    await check('direct_tool_namespace', async () => {
+      const config = await readEffectiveConfig();
+      const namespaces = directOnlyToolNamespaces(config, { requireHark: true });
+      directToolNamespace = HARK_DIRECT_TOOL_NAMESPACE;
+      return { namespace: directToolNamespace, namespaces };
+    }, 'Re-run Hark setup so Codex exposes Hark as one direct held tool.');
 
     await check('hooks', async () => {
       if (typeof appServer.listHooks !== 'function') {
@@ -854,7 +1004,9 @@ export async function doctorCommand(options = {}, dependencies = {}) {
       return expected;
     }, 'Restore the exact held-call Hark MCP settings and reload Codex.');
   } else {
-    for (const id of ['clock_source', 'hooks', 'mcp', 'mcp_config']) checks.push({
+    for (const id of [
+      'clock_source', 'direct_tool_namespace', 'hooks', 'mcp', 'mcp_config',
+    ]) checks.push({
       id, ok: false, error: 'app_server_unavailable', remediation: 'Restore the App Server first.',
     });
   }
@@ -897,6 +1049,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
     runtime: runtimeStatus,
     sandbox: sandboxStatus,
     clockSource,
+    directToolNamespace,
     supervisor: supervisorReady,
     checks,
   };
@@ -915,6 +1068,7 @@ function formatDoctorOutput(result) {
       + (result.sandbox?.backend ? ` (${result.sandbox.backend})` : ''),
     `Sandbox profiles: ${result.sandbox?.permissionProfiles?.join(', ') ?? 'unavailable'}`,
     `Clock source: ${result.clockSource ?? 'unavailable'}`,
+    `Hark tool exposure: ${result.directToolNamespace ?? 'unavailable'}`,
     `Hark installation: ${result.connected ? 'connected' : 'not connected'}`,
     ...result.checks.filter((check) => !check.ok).map(
       (check) => `Fix ${check.id}: ${check.error}. ${check.remediation}`,

@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hark",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Portable Hark durable-await core. Requires a certified host adapter; the Codex adapter ships in the parent package.",
   "author": {
     "name": "Dexter",

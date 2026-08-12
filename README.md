@@ -4,10 +4,10 @@ Public distribution of the Hark durable-await plugin for Codex.
 
 Hark lets one Codex task stop inference while it waits for an authenticated external event, then resume the same originating tool call exactly once.
 
-## Install v0.1.5
+## Install v0.1.6
 
 ```sh
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.5
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.6
 codex plugin add hark@hark
 ```
 
@@ -23,6 +23,10 @@ sibling, and the official bundled Bubblewrap helper used by Codex's normal
 Linux sandbox profiles. It repairs missing companions without replacing
 already-verified runtime files.
 
+Setup preserves existing `features.code_mode.direct_only_tool_namespaces`
+entries and ensures `mcp__hark` is exposed directly. Doctor fails closed when
+that direct exposure is absent.
+
 Setup and doctor also execute Codex's read-only and workspace Bubblewrap
 profiles. Ubuntu 24.04 hosts that restrict unprivileged user namespaces must
 load the scoped system profile described in the
@@ -36,8 +40,8 @@ This repository is a release-only distribution mirror. Hark is proprietary softw
 
 Release provenance:
 
-- Hark release: `02cd06aa450c-ac53280e79a2`
-- Source commit: `02cd06aa450c054c3a32559bc65edcaa278696e8`
-- Source tree: `236b48c5525234ae16eb0537999c915e40fab566`
-- Artifact digest: `ac53280e79a232603b134186936f1b88a102455d0ea2c01d5bea4c64dad2aa15`
-- Plugin digest: `f1da44a6ec186f5d03e93a16a560e1ec120c5c2509cfefb3576f14f9d0d07d98`
+- Hark release: `9c05a1276e96-acb61df15de9`
+- Source commit: `9c05a1276e961c979ed0d1ade447a19695a0c894`
+- Source tree: `5d374e676085a032bead774322750aaefd453fe0`
+- Artifact digest: `acb61df15de97e88f34ac531512b898b665ddb7fef8b1891c08aab9c8fe8ff85`
+- Plugin digest: `0445dc8bd14c8fe6c9837f6bc3446e3a861e1f2609f0b1a7819d659ed7dbed8a`

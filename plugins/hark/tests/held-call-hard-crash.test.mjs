@@ -1306,13 +1306,32 @@ async function readRequestBody(request) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function cancelApiResponse(awaitId, replay = false) {
+function cancelApiResponse({
+  awaitId,
+  armRequest,
+  cancelRequest,
+  replay = false,
+}) {
+  const cancelledAt = '2026-08-07T12:00:06.000Z';
+  const armed = armApiResponse(armRequest, { awaitId }).await;
   return {
     v: 'hark.await-cancel-result.v2',
     await: {
-      id: awaitId,
+      ...armed,
+      waiter: {
+        ...armed.waiter,
+        releasedAt: cancelledAt,
+      },
       state: 'cancelled',
-      cancelledAt: '2026-08-07T12:00:06.000Z',
+      suspendedAt: null,
+      wakePendingAt: null,
+      acceptedAt: null,
+      runningAt: null,
+      completedAt: null,
+      failedAt: null,
+      cancelledAt,
+      lastError: cancelRequest.reason,
+      updatedAt: cancelledAt,
     },
     replay,
   };
@@ -1771,7 +1790,12 @@ class LoopbackAwaitApi {
       return this.send(
         response,
         200,
-        cancelApiResponse(awaitId, replay),
+        cancelApiResponse({
+          awaitId,
+          armRequest: this.armRequest,
+          cancelRequest: this.cancelRequest,
+          replay,
+        }),
       );
     }
 

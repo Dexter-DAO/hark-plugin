@@ -166,6 +166,37 @@ function rawWake(overrides = {}) {
   };
 }
 
+function cancelApiResponse({
+  awaitId,
+  armRequest,
+  cancelRequest,
+  replay = false,
+}) {
+  const cancelledAt = '2026-08-07T12:00:05.000Z';
+  const armed = armApiResponse(armRequest, { awaitId }).await;
+  return {
+    v: 'hark.await-cancel-result.v2',
+    await: {
+      ...armed,
+      waiter: {
+        ...armed.waiter,
+        releasedAt: cancelledAt,
+      },
+      state: 'cancelled',
+      suspendedAt: null,
+      wakePendingAt: null,
+      acceptedAt: null,
+      runningAt: null,
+      completedAt: null,
+      failedAt: null,
+      cancelledAt,
+      lastError: cancelRequest.reason,
+      updatedAt: cancelledAt,
+    },
+    replay,
+  };
+}
+
 function recoveryRecords() {
   const request = createAwaitRequest(requestInput(), CLOCK);
   const armBinding = createArmBinding(request, {
@@ -309,18 +340,15 @@ async function crashReconciliationFixture() {
       calls.arm += 1;
       return armApiResponse(armRequest, { replay: calls.arm > 1 });
     },
-    async cancelAwait(awaitId) {
+    async cancelAwait(awaitId, cancelRequest) {
       calls.cancel += 1;
       if (calls.cancel === 1) calls.cancelApply += 1;
-      return {
-        v: 'hark.await-cancel-result.v2',
-        await: {
-          id: awaitId,
-          state: 'cancelled',
-          cancelledAt: '2026-08-07T12:00:05.000Z',
-        },
+      return cancelApiResponse({
+        awaitId,
+        armRequest,
+        cancelRequest,
         replay: calls.cancel > 1,
-      };
+      });
     },
     async commitAwait(awaitId, commitRequest) {
       calls.commit += 1;

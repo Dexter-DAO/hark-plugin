@@ -17,6 +17,38 @@ const TRANSIENT_CODES = new Set([
   'ENETUNREACH',
   'ETIMEDOUT',
 ]);
+const CANCELLED_AWAIT_KEYS = [
+  'v',
+  'id',
+  'preparationNonce',
+  'origin',
+  'checkpoint',
+  'binding',
+  'waiter',
+  'prepared',
+  'predicate',
+  'wakePolicy',
+  'state',
+  'armedAt',
+  'suspendedAt',
+  'wakePendingAt',
+  'acceptedAt',
+  'runningAt',
+  'completedAt',
+  'failedAt',
+  'cancelledAt',
+  'lastError',
+  'createdAt',
+  'updatedAt',
+];
+const CANCELLED_AWAIT_NULLABLE_LIFECYCLE_TIMESTAMPS = [
+  'suspendedAt',
+  'wakePendingAt',
+  'acceptedAt',
+  'runningAt',
+  'completedAt',
+  'failedAt',
+];
 
 function object(value, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -38,10 +70,23 @@ function exactKeys(value, keys, label) {
 }
 
 function timestamp(value, label) {
-  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+  if (typeof value !== 'string') throw new Error(`${label}_invalid`);
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== value) {
     throw new Error(`${label}_invalid`);
   }
   return value;
+}
+
+function nullableTimestamp(value, label) {
+  if (value === null) return null;
+  return timestamp(value, label);
+}
+
+function sameJson(actual, expected, label) {
+  if (sha256Canonical(actual) !== sha256Canonical(expected)) {
+    throw new Error(`${label}_mismatch`);
+  }
 }
 
 function responseEffectDigest(value) {
@@ -57,20 +102,74 @@ export function isTransientToolLifecycleError(error, signal = undefined) {
     || TRANSIENT_CODES.has(error?.code);
 }
 
-export function assertReconciledCancelApiResponse(value, awaitId) {
+export function assertReconciledCancelApiResponse(value, expected) {
+  const awaitId = expected?.awaitId;
+  const armRequest = object(expected?.armRequest, 'cancel_expected_arm_request');
+  const cancelRequest = object(expected?.cancelRequest, 'cancel_expected_request');
   const result = exactKeys(value, ['v', 'await', 'replay'], 'cancel_result');
   if (result.v !== 'hark.await-cancel-result.v2') {
     throw new Error('cancel_result_version_invalid');
   }
-  const cancelled = exactKeys(
-    result.await,
-    ['id', 'state', 'cancelledAt'],
-    'cancelled_await',
-  );
+  const cancelled = exactKeys(result.await, CANCELLED_AWAIT_KEYS, 'cancelled_await');
+  if (cancelled.v !== 'hark.await.v2') {
+    throw new Error('cancelled_await_version_invalid');
+  }
   if (cancelled.id !== awaitId || cancelled.state !== 'cancelled') {
     throw new Error('cancel_result_state_mismatch');
   }
-  timestamp(cancelled.cancelledAt, 'cancelled_at');
+  if (cancelled.preparationNonce !== armRequest.preparationNonce) {
+    throw new Error('cancelled_await_preparation_nonce_mismatch');
+  }
+  for (const field of ['origin', 'checkpoint', 'binding', 'prepared', 'predicate']) {
+    object(cancelled[field], `cancelled_await_${field}`);
+    sameJson(cancelled[field], armRequest[field], `cancelled_await_${field}`);
+  }
+  if (cancelled.wakePolicy !== armRequest.wakePolicy) {
+    throw new Error('cancelled_await_wake_policy_mismatch');
+  }
+  const waiter = exactKeys(
+    cancelled.waiter,
+    ['waiterId', 'leaseGeneration', 'leaseExpiresAt', 'releasedAt'],
+    'cancelled_await_waiter',
+  );
+  if (typeof waiter.waiterId !== 'string' || !waiter.waiterId) {
+    throw new Error('cancelled_await_waiter_id_invalid');
+  }
+  if (!Number.isSafeInteger(waiter.leaseGeneration) || waiter.leaseGeneration < 1) {
+    throw new Error('cancelled_await_waiter_generation_invalid');
+  }
+  timestamp(waiter.leaseExpiresAt, 'cancelled_await_waiter_expiry');
+  const armedAt = timestamp(cancelled.armedAt, 'cancelled_await_armed_at');
+  const createdAt = timestamp(cancelled.createdAt, 'cancelled_await_created_at');
+  const updatedAt = timestamp(cancelled.updatedAt, 'cancelled_await_updated_at');
+  for (const field of CANCELLED_AWAIT_NULLABLE_LIFECYCLE_TIMESTAMPS) {
+    nullableTimestamp(cancelled[field], `cancelled_await_${field}`);
+  }
+  const cancelledAt = timestamp(cancelled.cancelledAt, 'cancelled_await_cancelledAt');
+  if (
+    Date.parse(armedAt) > Date.parse(createdAt)
+    || Date.parse(cancelledAt) < Date.parse(createdAt)
+  ) throw new Error('cancelled_await_lifecycle_order_invalid');
+  if (updatedAt !== cancelledAt) {
+    throw new Error('cancelled_await_updated_at_mismatch');
+  }
+  if (cancelled.waiter.releasedAt !== cancelledAt) {
+    throw new Error('cancelled_await_waiter_release_mismatch');
+  }
+  if (cancelled.lastError !== cancelRequest.reason) {
+    throw new Error('cancelled_await_last_error_mismatch');
+  }
+  if (
+    cancelled.suspendedAt !== null
+    || cancelled.acceptedAt !== null
+    || cancelled.runningAt !== null
+    || cancelled.completedAt !== null
+    || cancelled.failedAt !== null
+  ) throw new Error('cancelled_await_lifecycle_conflict');
+  if (
+    cancelled.wakePendingAt !== null
+    && Date.parse(cancelled.wakePendingAt) > Date.parse(cancelledAt)
+  ) throw new Error('cancelled_await_lifecycle_order_invalid');
   if (typeof result.replay !== 'boolean') throw new Error('cancel_result_replay_invalid');
   return result;
 }
@@ -243,7 +342,11 @@ export class HarkToolErrorLifecycle {
           cancelRequest,
           { signal },
         ),
-        armBinding.awaitId,
+        {
+          awaitId: armBinding.awaitId,
+          armRequest: attempt.armRequest,
+          cancelRequest,
+        },
       );
     } catch (error) {
       if (isTransientToolLifecycleError(error, signal)) {

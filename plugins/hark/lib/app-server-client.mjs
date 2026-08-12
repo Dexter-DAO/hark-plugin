@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { isAbsolute, join, normalize } from 'node:path';
 import { createInterface } from 'node:readline';
 
 export const CODEX_APP_SERVER_COMPATIBILITY = Object.freeze({
@@ -43,6 +44,44 @@ function requireObject(value, label) {
 function requireString(value, label) {
   if (typeof value !== 'string' || value.length === 0) {
     throw new AppServerProtocolError(`${label} must be a non-empty string`, value);
+  }
+  return value;
+}
+
+function requireJsonValue(value, label, seen = new Set()) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new AppServerProtocolError(`${label} must contain only finite JSON numbers`, value);
+    }
+    return value;
+  }
+  if (typeof value !== 'object') {
+    throw new AppServerProtocolError(`${label} must be a JSON value`, value);
+  }
+  if (seen.has(value)) {
+    throw new AppServerProtocolError(`${label} must not contain a cycle`, value);
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => requireJsonValue(entry, `${label}[${index}]`, seen));
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new AppServerProtocolError(`${label} must contain only plain JSON objects`, value);
+    }
+    for (const [key, entry] of Object.entries(value)) {
+      requireJsonValue(entry, `${label}.${key}`, seen);
+    }
+  }
+  seen.delete(value);
+  return value;
+}
+
+function requireAbsolutePath(value, label) {
+  requireString(value, label);
+  if (!isAbsolute(value) || normalize(value) !== value) {
+    throw new AppServerProtocolError(`${label} must be an absolute normalized path`, value);
   }
   return value;
 }
@@ -123,7 +162,7 @@ export class AppServerClient extends EventEmitter {
     this.clientInfo = options.clientInfo ?? {
       name: 'hark-codex-supervisor',
       title: 'Hark Codex Supervisor',
-      version: '0.1.5',
+      version: '0.1.6',
     };
 
     this.transport = null;
@@ -269,6 +308,135 @@ export class AppServerClient extends EventEmitter {
       'config/read result',
     );
     requireObject(result.config, 'config/read result.config');
+    return result;
+  }
+
+  /**
+   * Write one value through the pinned Codex 0.147 App Server config API.
+   *
+   * `upsert` only deep-merges TOML tables in 0.147. Array callers must first
+   * read and merge the current array, then write the complete array with
+   * `replace` and the user layer's version as `expectedVersion`.
+   */
+  async writeConfigValue(params, { allowOverridden = false } = {}) {
+    const input = requireObject(params, 'config/value/write params');
+    const allowedKeys = new Set([
+      'keyPath',
+      'value',
+      'mergeStrategy',
+      'filePath',
+      'expectedVersion',
+    ]);
+    const unknownKeys = Object.keys(input).filter((key) => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+      throw new AppServerProtocolError(
+        'config/value/write params contain unsupported fields',
+        { unknownKeys },
+      );
+    }
+    if (typeof allowOverridden !== 'boolean') {
+      throw new AppServerProtocolError('allowOverridden must be a boolean', allowOverridden);
+    }
+
+    const keyPath = requireString(input.keyPath, 'config/value/write params.keyPath');
+    const value = requireJsonValue(input.value, 'config/value/write params.value');
+    const mergeStrategy = input.mergeStrategy;
+    if (mergeStrategy !== 'replace' && mergeStrategy !== 'upsert') {
+      throw new AppServerProtocolError(
+        'config/value/write params.mergeStrategy must be replace or upsert',
+        mergeStrategy,
+      );
+    }
+    const filePath = input.filePath ?? null;
+    if (filePath !== null) {
+      requireAbsolutePath(filePath, 'config/value/write params.filePath');
+    }
+    const expectedVersion = input.expectedVersion ?? null;
+    if (expectedVersion !== null) {
+      requireString(expectedVersion, 'config/value/write params.expectedVersion');
+    }
+
+    const result = requireObject(
+      await this.request('config/value/write', {
+        keyPath,
+        value,
+        mergeStrategy,
+        filePath,
+        expectedVersion,
+      }),
+      'config/value/write result',
+    );
+    const status = requireString(result.status, 'config/value/write result.status');
+    if (status !== 'ok' && status !== 'okOverridden') {
+      throw new AppServerProtocolError('config/value/write result.status is unsupported', result);
+    }
+    requireString(result.version, 'config/value/write result.version');
+    const responseFilePath = requireAbsolutePath(
+      result.filePath,
+      'config/value/write result.filePath',
+    );
+    const defaultFilePath = join(
+      requireAbsolutePath(
+        this.initializeResult?.codexHome,
+        'initialize result.codexHome',
+      ),
+      'config.toml',
+    );
+    const expectedFilePath = filePath ?? defaultFilePath;
+    if (responseFilePath !== expectedFilePath) {
+      throw new AppServerProtocolError('Codex wrote an unexpected config file', {
+        expected: expectedFilePath,
+        received: responseFilePath,
+      });
+    }
+
+    if (!Object.hasOwn(result, 'overriddenMetadata')) {
+      throw new AppServerProtocolError(
+        'config/value/write result.overriddenMetadata is missing',
+        result,
+      );
+    }
+    if (status === 'ok') {
+      if (result.overriddenMetadata !== null) {
+        throw new AppServerProtocolError(
+          'config/value/write ok result must not include overridden metadata',
+          result,
+        );
+      }
+      return result;
+    }
+
+    const metadata = requireObject(
+      result.overriddenMetadata,
+      'config/value/write result.overriddenMetadata',
+    );
+    requireString(metadata.message, 'config/value/write overriddenMetadata.message');
+    const overridingLayer = requireObject(
+      metadata.overridingLayer,
+      'config/value/write overriddenMetadata.overridingLayer',
+    );
+    requireString(
+      overridingLayer.version,
+      'config/value/write overriddenMetadata.overridingLayer.version',
+    );
+    const layerSource = requireObject(
+      overridingLayer.name,
+      'config/value/write overriddenMetadata.overridingLayer.name',
+    );
+    requireString(
+      layerSource.type,
+      'config/value/write overriddenMetadata.overridingLayer.name.type',
+    );
+    requireJsonValue(
+      metadata.effectiveValue,
+      'config/value/write overriddenMetadata.effectiveValue',
+    );
+    if (!allowOverridden) {
+      throw new AppServerProtocolError(
+        'Codex wrote the config value but a higher-precedence layer overrides it',
+        result,
+      );
+    }
     return result;
   }
 
