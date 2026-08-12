@@ -198,6 +198,8 @@ class FakeHeldService {
           type: this.arm.predicate.type,
           subject: this.arm.predicate.subject,
           qualificationDigest: this.arm.predicate.qualificationDigest,
+          sourceAdapter: 'webhook.v1',
+          authMode: 'source_hmac',
           observedAt: '2026-08-07T12:00:02.000Z',
           summary: 'Job 42 completed.',
           data: { status: 'completed' },
@@ -225,7 +227,7 @@ test('lists only the elegant one-call durable wait tool', async () => {
     { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
   ]);
   assert.equal(responses[0].result.serverInfo.name, 'hark');
-  assert.equal(responses[0].result.serverInfo.version, '0.1.8');
+  assert.equal(responses[0].result.serverInfo.version, '0.1.9');
   assert.deepEqual(responses[1].result.tools.map((tool) => tool.name), ['hark_await']);
   assert.deepEqual(responses[1].result.tools[0].inputSchema.required, [
     'request', 'name', 'source', 'condition',
@@ -257,6 +259,13 @@ test('arms, commits, and returns one authenticated wake through the held call', 
   assert.equal(result.structuredContent.v, 'hark.await-satisfied.v1');
   assert.equal(result.structuredContent.wake.wakeId, 'wake-1');
   assert.equal(result.structuredContent.wake.awaitId, 'await-1');
+  assert.deepEqual({
+    sourceAdapter: result.structuredContent.wake.signal.sourceAdapter,
+    authMode: result.structuredContent.wake.signal.authMode,
+  }, {
+    sourceAdapter: 'webhook.v1',
+    authMode: 'source_hmac',
+  });
   assert.equal(JSON.stringify(result.structuredContent).includes('waiter-lease-secret'), false);
   assert.equal(JSON.stringify(result.structuredContent).includes('wakeDeliveryDigest'), false);
   const claim = result._meta[CLAIM_META_KEY];

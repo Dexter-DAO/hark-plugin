@@ -154,6 +154,8 @@ function rawWake(awaitId, checkpointDigest) {
       type: 'job.completed',
       subject: 'job-42',
       qualificationDigest: 'a'.repeat(64),
+      sourceAdapter: 'webhook.v1',
+      authMode: 'source_hmac',
       observedAt: '2026-08-07T12:00:04.000Z',
       summary: 'Job completed.',
       data: { status: 'completed' },

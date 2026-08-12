@@ -156,6 +156,8 @@ function rawWake(overrides = {}) {
       type: 'job.completed',
       subject: 'job-42',
       qualificationDigest: 'q'.replace('q', 'a').repeat(64),
+      sourceAdapter: 'webhook.v1',
+      authMode: 'source_hmac',
       observedAt: '2026-08-07T12:00:04.000Z',
       summary: 'Job completed.',
       data: { status: 'completed', output: { artifactId: 'artifact-1' } },
@@ -1795,6 +1797,47 @@ test('delivery and tool result default-deny raw lease, access, binding, and extr
     ...records.toolResultReturned,
     wakeDeliveryDigest: '4'.repeat(64),
   }, records.wakeDelivery, records.toolResult), /tool_result_returned_wake_delivery_digest_mismatch/);
+});
+
+test('wake signal preserves exact API provenance and rejects altered or unknown provenance', () => {
+  const sourceHmac = sanitizeWakeEnvelope(rawWake());
+  assert.equal(sourceHmac.signal.sourceAdapter, 'webhook.v1');
+  assert.equal(sourceHmac.signal.authMode, 'source_hmac');
+
+  const installationTest = rawWake();
+  installationTest.signal.sourceAdapter = 'hark.installation-test.v1';
+  installationTest.signal.authMode = 'installation_test';
+  assert.deepEqual(sanitizeWakeEnvelope(installationTest).signal, installationTest.signal);
+
+  const altered = rawWake();
+  altered.signal.authMode = 'bearer';
+  assert.throws(() => sanitizeWakeEnvelope(altered), /signal_auth_mode_invalid/);
+  const oversizedAdapter = rawWake();
+  oversizedAdapter.signal.sourceAdapter = 'a'.repeat(121);
+  assert.throws(
+    () => sanitizeWakeEnvelope(oversizedAdapter),
+    /signal_source_adapter_invalid/,
+  );
+  for (const field of ['sourceAdapter', 'authMode']) {
+    const missing = rawWake();
+    delete missing.signal[field];
+    assert.throws(
+      () => sanitizeWakeEnvelope(missing),
+      new RegExp(`wake_signal_field_required:${field}`),
+    );
+  }
+  const paddedAdapter = rawWake();
+  paddedAdapter.signal.sourceAdapter = ' webhook.v1 ';
+  assert.throws(
+    () => sanitizeWakeEnvelope(paddedAdapter),
+    /signal_source_adapter_invalid/,
+  );
+  const unknown = rawWake();
+  unknown.signal.authentication = 'source_hmac';
+  assert.throws(
+    () => sanitizeWakeEnvelope(unknown),
+    /wake_signal_field_unsupported:authentication/,
+  );
 });
 
 test('validation is exact and bounded wait polls succeed or time out', async () => {

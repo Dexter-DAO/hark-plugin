@@ -1469,6 +1469,8 @@ class LoopbackAwaitApi {
           type: this.armRequest.predicate.type,
           subject: this.armRequest.predicate.subject,
           qualificationDigest: this.armRequest.predicate.qualificationDigest,
+          sourceAdapter: 'webhook.v1',
+          authMode: 'source_hmac',
           observedAt: '2026-08-07T12:00:04.000Z',
           summary: 'Release 42 is healthy.',
           data: { status: 'healthy' },

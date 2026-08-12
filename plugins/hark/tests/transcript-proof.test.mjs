@@ -557,6 +557,31 @@ test('preflight proves a stable empty boundary before dispatch', async () => {
   assert.match(proof.historyDigest, /^[a-f0-9]{64}$/);
 });
 
+test('preflight accepts an exact pinned tool-wait boundary without weakening its contract', async () => {
+  const value = await toolWaitFixture();
+  const boundary = await captureToolWait(value);
+  await writeFile(value.transcriptPath, [
+    toolWaitPrefix(),
+    turnAborted(ORIGIN),
+  ].join(''));
+
+  const proof = await preflightCodexWaitHistory(boundary, { scannedAt: SCANNED_AT });
+  assert.equal(proof.conversationId, SESSION);
+  assert.equal(proof.originTaskId, ORIGIN);
+  assert.deepEqual(proof.originTerminal, {
+    type: 'turn_aborted', observedAt: '2026-08-07T12:00:00.000Z',
+  });
+
+  await assert.rejects(
+    preflightCodexWaitHistory({ ...boundary, cliVersion: '0.148.0' }),
+    /codex_rollout_cli_version_mismatch:0\.148\.0:0\.147\.0/,
+  );
+  await assert.rejects(
+    preflightCodexWaitHistory({ ...boundary, unexpected: true }),
+    /codex_tool_wait_boundary_field_unsupported:unexpected/,
+  );
+});
+
 test('preflight and final proof bind one exact turn_aborted origin terminal', async () => {
   const value = await fixture();
   const boundary = await capture(value);

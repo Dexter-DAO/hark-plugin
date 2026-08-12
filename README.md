@@ -4,10 +4,10 @@ Public distribution of the Hark durable-await plugin for Codex.
 
 Hark lets one Codex task stop inference while it waits for an authenticated external event, then resume the same originating tool call exactly once.
 
-## Install v0.1.8
+## Install v0.1.9
 
 ```sh
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.8
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.9
 codex plugin add hark@hark
 ```
 
@@ -40,8 +40,8 @@ This repository is a release-only distribution mirror. Hark is proprietary softw
 
 Release provenance:
 
-- Hark release: `de81cecb3d6e-137c661067ec`
-- Source commit: `de81cecb3d6ec4c55669cde2aa6c1046c938964a`
-- Source tree: `6fb58d784c1db3c71f0a6a4ce3049b580b9e7075`
-- Artifact digest: `137c661067ecc00b836a2352810678c421f05ff134516259bdaedf0a5824ea7a`
-- Plugin digest: `e9ec4ac4bdb7a6e6d576ce9f65847854cf775a81a90a01d8c03e2459796dca04`
+- Hark release: `e30ddf35fea8-4d7261a1cd58`
+- Source commit: `e30ddf35fea8e2cb78602553d0bf0dc4a7b6eb8b`
+- Source tree: `96d76bbcea9c5f998d9cf7bd26213f24b9df58cc`
+- Artifact digest: `4d7261a1cd58e41e62924e06994ea4b00272a9de1c3b7cfc89804fee1c2e8eb5`
+- Plugin digest: `f045c2e669621d5df902d94a862e85a7cce5d25cb9554eaf7f5e90f2271efda2`

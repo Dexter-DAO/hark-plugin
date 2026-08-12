@@ -1052,8 +1052,9 @@ export function assertSuspensionCommitted(
 
 const SIGNAL_KEYS = [
   'id', 'sourceSignalId', 'type', 'subject', 'qualificationDigest', 'observedAt',
-  'summary', 'data', 'evidence',
+  'sourceAdapter', 'authMode', 'summary', 'data', 'evidence',
 ];
+const SIGNAL_AUTH_MODES = new Set(['source_hmac', 'installation_test']);
 
 function sanitizeSignal(value) {
   assertPlainObject(value, 'wake_signal');
@@ -1063,7 +1064,9 @@ function sanitizeSignal(value) {
     ['sourceSignalId', 'source_signal_id'],
     ['type', 'signal_type'],
     ['subject', 'signal_subject'],
-  ]) assertIdentifier(value[field], label, 1024);
+    ['sourceAdapter', 'signal_source_adapter'],
+  ]) assertIdentifier(value[field], label, field === 'sourceAdapter' ? 120 : 1024);
+  if (!SIGNAL_AUTH_MODES.has(value.authMode)) throw new Error('signal_auth_mode_invalid');
   assertDigest(value.qualificationDigest, 'qualification_digest');
   assertTimestamp(value.observedAt, 'signal_observed_at');
   if (typeof value.summary !== 'string' || value.summary.length > 16_000) {

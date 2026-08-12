@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,10 @@ import { sha256Canonical } from '../lib/canonical.mjs';
 import { HarkHookInbox } from '../lib/hook-inbox.mjs';
 import { HarkJournal } from '../lib/journal.mjs';
 import { HarkApiError } from '../lib/service-client.mjs';
+import {
+  captureCodexToolWaitBoundary,
+  preflightCodexWaitHistory,
+} from '../lib/transcript-proof.mjs';
 import {
   buildWakePrompt,
   HarkCodexSupervisor,
@@ -562,6 +566,8 @@ function targetedCrashArtifacts({ receipt = true } = {}) {
       type: draft.source.kind,
       subject: draft.source.subject,
       qualificationDigest: draft.qualificationDigest,
+      sourceAdapter: 'webhook.v1',
+      authMode: 'source_hmac',
       observedAt: '2026-08-07T12:00:02.000Z',
       summary: 'Job completed.',
       data: {},
@@ -961,6 +967,7 @@ function wakeResult(armed, overrides = {}) {
         id: 'signal-1', sourceSignalId: 'source-1', type: armed.prepared.source.kind,
         subject: armed.prepared.source.subject,
         qualificationDigest: armed.prepared.qualificationDigest,
+        sourceAdapter: 'webhook.v1', authMode: 'source_hmac',
         observedAt: '2026-08-07T12:00:02.000Z', summary: 'Job completed.', data: {}, evidence: [],
       },
       createdAt: '2026-08-07T12:00:02.000Z',
@@ -1307,6 +1314,7 @@ test('claims, journals, and wakes the exact same thread once, then records compl
       signal: {
         id: 'signal-1', sourceSignalId: 'source-1', type: draft.source.kind,
         subject: draft.source.subject, qualificationDigest: draft.qualificationDigest,
+        sourceAdapter: 'webhook.v1', authMode: 'source_hmac',
         observedAt: '2026-08-07T12:00:02.000Z', summary: 'Job completed.', data: {}, evidence: [],
       },
       createdAt: '2026-08-07T12:00:02.000Z',
@@ -1831,6 +1839,80 @@ test('owner-abort authority requires matching App Server and physical rollout te
     assert.equal(await heldWaitCertifier.provide(request), null);
     await environment.supervisor.stop();
   });
+});
+
+test('owner-abort production preflight accepts the captured tool boundary but requires a physical abort', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-supervisor-owner-abort-'));
+  const codexHome = path.join(directory, 'codex-home');
+  const sessions = path.join(codexHome, 'sessions', '2026', '08', '07');
+  const transcriptPath = path.join(sessions, 'rollout-thread-1.jsonl');
+  await mkdir(sessions, { recursive: true });
+  const toolInput = {
+    request: 'Continue job 42.',
+    name: 'Job 42',
+    source: { kind: 'job.completed', adapter: 'webhook.v1', subject: 'job-42' },
+    condition: { status: { equals: 'completed' } },
+  };
+  const rolloutLine = (type, payload) => `${JSON.stringify({
+    timestamp: '2026-08-07T12:00:01.000Z',
+    type,
+    payload,
+  })}\n`;
+  const prefix = [
+    rolloutLine('session_meta', { id: 'thread-1', cli_version: '0.147.0' }),
+    rolloutLine('turn_context', { turn_id: 'turn-1' }),
+    rolloutLine('response_item', {
+      type: 'function_call',
+      call_id: 'item-1',
+      namespace: 'hark',
+      name: 'hark_await',
+      arguments: JSON.stringify(toolInput),
+    }),
+  ].join('');
+  await writeFile(transcriptPath, prefix, { mode: 0o600 });
+  const transcriptBoundary = await captureCodexToolWaitBoundary({
+    transcriptPath,
+    threadPath: transcriptPath,
+    codexHome,
+    sessionId: 'thread-1',
+    originTaskId: 'turn-1',
+    toolUseId: 'item-1',
+    toolName: 'mcp__hark__hark_await',
+    toolInput,
+  });
+  const { request: requestFixture, armAttempt: armAttemptFixture } = heldCrashArtifacts();
+  const request = {
+    ...requestFixture,
+    originalInputDigest: transcriptBoundary.inputDigest,
+  };
+  const armAttempt = { ...armAttemptFixture, transcriptBoundary };
+  const heldWaitCertifier = crashCertifier(armAttempt);
+  const environment = await factoryEnvironment({
+    heldWaitCertifier,
+    transcriptProof: {
+      ...cleanTranscriptProof(),
+      preflight: preflightCodexWaitHistory,
+    },
+  });
+  await suspendOrigin(environment);
+  const origin = environment.appServers.thread.turns.find((turn) => turn.id === 'turn-1');
+  origin.status = 'interrupted';
+
+  assert.equal(await heldWaitCertifier.provide(request), null);
+  environment.supervisor.assertHealthy();
+
+  await writeFile(transcriptPath, `${prefix}${rolloutLine('event_msg', {
+    type: 'turn_aborted',
+    turn_id: 'turn-1',
+    reason: 'interrupted',
+  })}`);
+  const proof = await heldWaitCertifier.provide(request);
+  assert.deepEqual(proof.rollout.originTerminal, {
+    type: 'turn_aborted',
+    observedAt: '2026-08-07T12:00:01.000Z',
+  });
+  environment.supervisor.assertHealthy();
+  await environment.supervisor.stop();
 });
 
 test('targeted recovery proves locally, binds detail, claims, and dispatches in that order', async () => {

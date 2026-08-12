@@ -166,7 +166,7 @@ export class AppServerClient extends EventEmitter {
     this.clientInfo = options.clientInfo ?? {
       name: 'hark-codex-supervisor',
       title: 'Hark Codex Supervisor',
-      version: '0.1.8',
+      version: '0.1.9',
     };
 
     this.transport = null;

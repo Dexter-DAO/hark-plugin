@@ -34,7 +34,7 @@ import {
 } from '../lib/tool-wait-protocol.mjs';
 import { captureCodexToolWaitBoundary } from '../lib/transcript-proof.mjs';
 
-const SERVER = { name: 'hark', version: '0.1.8' };
+const SERVER = { name: 'hark', version: '0.1.9' };
 const CLAIM_META_KEY = 'cash.dexter.hark/claim';
 const CLAIM_META_VERSION = PRIVATE_CLAIM_REFERENCE_VERSION;
 const MCP_PROTOCOL_VERSION = '2025-06-18';

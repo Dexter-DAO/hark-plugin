@@ -275,6 +275,27 @@ export function assertCodexToolWaitBoundary(value) {
   return boundary;
 }
 
+function validateWaitHistoryPreflightBoundary(value) {
+  if (value?.v !== CODEX_TOOL_WAIT_BOUNDARY_VERSION) return validateBoundary(value);
+
+  // Held-call owner-abort preflight starts from the richer boundary captured at
+  // tool dispatch. Validate that complete, pinned boundary before projecting
+  // only the rollout identity fields consumed by the generic history scanner.
+  // Final wake proof remains bound to the separately captured rollout boundary.
+  const boundary = assertCodexToolWaitBoundary(value);
+  return validateBoundary({
+    v: CODEX_ROLLOUT_BOUNDARY_VERSION,
+    historySource: boundary.historySource,
+    transcriptPath: boundary.transcriptPath,
+    sessionId: boundary.conversationId,
+    originTaskId: boundary.originTaskId,
+    dev: boundary.dev,
+    ino: boundary.ino,
+    byteLength: boundary.byteLength,
+    prefixSha256: boundary.prefixSha256,
+  });
+}
+
 function assertPinnedSessionMeta(value, sessionId) {
   if (value.payload?.id !== sessionId) throw new Error('codex_rollout_session_mismatch');
   const cliVersion = requiredString(
@@ -984,7 +1005,7 @@ export async function captureCodexRolloutBoundary({
 export async function preflightCodexWaitHistory(boundaryValue, {
   scannedAt = new Date(),
 } = {}) {
-  const boundary = validateBoundary(boundaryValue);
+  const boundary = validateWaitHistoryPreflightBoundary(boundaryValue);
   const noFollow = constants.O_NOFOLLOW ?? 0;
   const handle = await open(boundary.transcriptPath, constants.O_RDONLY | noFollow);
   try {
