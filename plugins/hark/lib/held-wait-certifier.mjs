@@ -593,7 +593,7 @@ export class HarkHeldWaitCertifier {
       persistedBoundary.boundary,
       this.runtimeId,
     );
-    if (!intent) return { kind: 'legacy' };
+    if (!intent) return { kind: 'pending' };
     await fence();
     const certification = await this.service.certifyAwait(delivery.awaitId);
     const remote = classifyToolResultObservationCertification(certification, {
@@ -608,9 +608,11 @@ export class HarkHeldWaitCertifier {
         await fence();
         await this.claimStore.consume(intent.claimReference, intent.binding);
       }
-      return remote;
+      return { ...remote, claimReference: intent.claimReference };
     }
-    if (remote.kind !== 'absent') return remote;
+    if (remote.kind !== 'absent') {
+      return { ...remote, claimReference: intent.claimReference };
+    }
     if (claim.state === 'consumed') {
       throw new Error('consumed_private_claim_without_remote_observation');
     }
@@ -625,13 +627,17 @@ export class HarkHeldWaitCertifier {
         code === 'wake_lease_stale'
         || code === 'runtime_lifecycle_receipt_already_recorded'
         || code === 'runtime_receipt_replay_conflict'
-      ) return { kind: 'pending' };
+      ) return { kind: 'pending', claimReference: intent.claimReference };
       throw error;
     }
     assertToolResultObservationAck(response, intent);
     await fence();
     await this.claimStore.consume(intent.claimReference, intent.binding);
-    return { kind: 'observed', observation: intent.publicReceipt.toolResultObservation };
+    return {
+      kind: 'observed',
+      observation: intent.publicReceipt.toolResultObservation,
+      claimReference: intent.claimReference,
+    };
   }
 
   async #recoverMissingReturned(
@@ -654,20 +660,20 @@ export class HarkHeldWaitCertifier {
     }
     if (remote.kind === 'recovery_complete') return remote;
 
-    let observationIntent = null;
-    if (remote.kind === 'absent') {
-      observationIntent = await this.protocol.readToolResultObservationIntent?.(
-        delivery,
-        result,
-        persistedBoundary.boundary,
-        this.runtimeId,
-      );
-      if (!observationIntent) return { kind: 'pending' };
-    }
-
+    const observationIntent = await this.protocol.readToolResultObservationIntent?.(
+      delivery,
+      result,
+      persistedBoundary.boundary,
+      this.runtimeId,
+    );
+    if (!observationIntent) return { kind: 'pending' };
     const boundary = persistedBoundary.boundary;
     const inspection = assertInspection(
-      await this.inspectToolWait(boundary, { toolResult: result }),
+      await this.inspectToolWait(boundary, {
+        toolResult: result,
+        wakeDeliveryDigest: delivery.wakeDeliveryDigest,
+        claimReference: observationIntent?.claimReference,
+      }),
       boundary,
       sha256Canonical(result),
     );
@@ -827,11 +833,16 @@ export class HarkHeldWaitCertifier {
       proof = await this.proveToolWait(returned.transcriptBoundary, {
         toolResult: result,
         wakeDeliveryDigest: returned.wakeDeliveryDigest,
+        claimReference: observation.claimReference,
       });
     } catch (error) {
       if (!isTransient(error)) throw error;
       const inspection = assertInspection(
-        await this.inspectToolWait(returned.transcriptBoundary, { toolResult: result }),
+        await this.inspectToolWait(returned.transcriptBoundary, {
+          toolResult: result,
+          wakeDeliveryDigest: returned.wakeDeliveryDigest,
+          claimReference: observation.claimReference,
+        }),
         returned.transcriptBoundary,
         returned.resultDigest,
       );

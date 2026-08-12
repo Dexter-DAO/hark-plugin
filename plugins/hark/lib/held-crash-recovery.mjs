@@ -214,9 +214,17 @@ export class HarkHeldCrashRecovery {
       || canonicalJson(delivery.wakeEnvelope) !== canonicalJson(sanitizeWakeEnvelope(wake))
     ) throw new Error('recover_waiter_local_delivery_conflict');
     const result = createToolWaitResult(delivery);
+    const observationIntent = await this.protocol.readToolResultObservationIntent?.(
+      delivery,
+      result,
+      context.persistedBoundary.boundary,
+      this.runtimeId,
+    );
     try {
       const inspection = await this.inspectToolWait(context.persistedBoundary.boundary, {
         toolResult: result,
+        wakeDeliveryDigest: delivery.wakeDeliveryDigest,
+        claimReference: observationIntent?.claimReference,
       });
       if (
         inspection.state === 'origin_aborted_before_result'
@@ -235,10 +243,17 @@ export class HarkHeldCrashRecovery {
   }
 
   async #proveOrInspect(context, delivery, result) {
+    const observationIntent = await this.protocol.readToolResultObservationIntent?.(
+      delivery,
+      result,
+      context.persistedBoundary.boundary,
+      this.runtimeId,
+    );
     try {
       const proof = await this.proveToolWait(context.persistedBoundary.boundary, {
         toolResult: result,
         wakeDeliveryDigest: delivery.wakeDeliveryDigest,
+        claimReference: observationIntent?.claimReference,
       });
       return { action: 'proved', proof };
     } catch (error) {
@@ -246,6 +261,8 @@ export class HarkHeldCrashRecovery {
       try {
         const inspection = await this.inspectToolWait(context.persistedBoundary.boundary, {
           toolResult: result,
+          wakeDeliveryDigest: delivery.wakeDeliveryDigest,
+          claimReference: observationIntent?.claimReference,
         });
         if (
           inspection.state === 'origin_aborted_before_result'

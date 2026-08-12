@@ -1003,7 +1003,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.10' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.11' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -1056,7 +1056,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.10', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.11', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -1485,7 +1485,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.10', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.11', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);

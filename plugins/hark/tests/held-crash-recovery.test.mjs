@@ -3,10 +3,12 @@ import test from 'node:test';
 
 import { sha256Canonical } from '../lib/canonical.mjs';
 import { HarkHeldCrashRecovery } from '../lib/held-crash-recovery.mjs';
+import { createPrivateClaimBinding } from '../lib/private-claim-store.mjs';
 import {
   createArmBinding,
   createAwaitRequest,
   createSuspensionCommitted,
+  createToolResultObservationIntent,
   createToolResultReturned,
   createToolWaitResult,
   createTranscriptBoundary,
@@ -106,6 +108,29 @@ function records() {
     wakeDeliveryDigest: WAKE_DIGEST,
     transcriptBoundary: boundary,
   }, CLOCK);
+  const binding = createPrivateClaimBinding({
+    eventId: delivery.eventId,
+    deliveryId: delivery.deliveryId,
+    awaitId: delivery.awaitId,
+    wakeId: delivery.wakeId,
+    toolUseId: delivery.toolUseId,
+    checkpointDigest: delivery.checkpointDigest,
+    wakeDeliveryDigest: delivery.wakeDeliveryDigest,
+    toolResultDigest: sha256Canonical(result),
+  });
+  const observationIntent = createToolResultObservationIntent({
+    delivery,
+    result,
+    transcriptBoundary: boundary,
+    runtimeId: 'runtime-1',
+    claimReference: {
+      v: 'hark.codex-held-claim-ref.v1',
+      locator: `hhc_${'A'.repeat(43)}`,
+      bindingDigest: sha256Canonical(binding),
+      wakeDeliveryDigest: binding.wakeDeliveryDigest,
+      toolResultDigest: binding.toolResultDigest,
+    },
+  }, CLOCK);
   const proof = {
     v: 'hark.codex-tool-wait-proof.v1',
     historySource: 'codex.rollout-jsonl.v1',
@@ -120,12 +145,14 @@ function records() {
   };
   return {
     request, armBinding, persistedBoundary, delivery, result, returned, proof, wake,
+    observationIntent,
   };
 }
 
 function harness({
   returned = true,
   delivery = true,
+  observationIntent = true,
   proofError = null,
   inspectionState = 'waiting',
 } = {}) {
@@ -138,6 +165,9 @@ function harness({
     async readArmBinding() { return value.armBinding; },
     async readTranscriptBoundary() { return value.persistedBoundary; },
     async readWakeDelivery() { return delivery ? value.delivery : null; },
+    async readToolResultObservationIntent() {
+      return observationIntent ? value.observationIntent : null;
+    },
     async readToolResultReturned() { return recoveredReturned; },
     async publishToolResultReturned() {
       recoveredReturned = value.returned;
@@ -241,6 +271,48 @@ test('stays pending on ambiguous proof and exposes a hard abort only to the supe
   assert.equal(aborted.receipts.length, 0);
 });
 
+test('recovery without a durable claim intent falls back only after an exact abort', async () => {
+  const value = harness({
+    observationIntent: false,
+    proofError: 'codex_tool_output_missing',
+    inspectionState: 'origin_aborted_before_result',
+  });
+  let proofCalls = 0;
+  let inspectionCalls = 0;
+  value.recovery.proveToolWait = async () => {
+    proofCalls += 1;
+    throw new Error('codex_tool_output_missing');
+  };
+  value.recovery.inspectToolWait = async () => {
+    inspectionCalls += 1;
+    return { v: 'hark.codex-tool-wait-inspection.v1', state: 'origin_aborted_before_result' };
+  };
+  const resolution = await value.recovery.recoverHeldTool({
+    wake: value.wake,
+    claim: recoveryClaim(),
+  });
+  assert.equal(resolution.action, 'fallback');
+  assert.equal(resolution.inspection.state, 'origin_aborted_before_result');
+  assert.equal(proofCalls, 1);
+  assert.equal(inspectionCalls, 1);
+  assert.equal(value.receipts.length, 0);
+  assert.deepEqual(value.recoveredReturned, value.returned);
+  assert.equal(value.completionPosted, null);
+
+  const waiting = harness({
+    observationIntent: false,
+    proofError: 'codex_tool_output_missing',
+    inspectionState: 'waiting',
+  });
+  const pending = await waiting.recovery.recoverHeldTool({
+    wake: waiting.wake,
+    claim: recoveryClaim(),
+  });
+  assert.equal(pending.action, 'pending');
+  assert.equal(pending.reason, 'waiting');
+  assert.equal(waiting.receipts.length, 0);
+});
+
 test('fails closed when the server recovery digest differs from the persisted delivery', async () => {
   const value = harness();
   await assert.rejects(
@@ -270,6 +342,19 @@ test('recover_waiter distinguishes a lost waiter from an exact requeued held res
     wake: afterResult.wake,
   });
   assert.equal(afterResultResolution.action, 'fallback');
+});
+
+test('recover_waiter falls back after abort in the delivery-before-intent crash window', async () => {
+  const value = harness({
+    observationIntent: false,
+    inspectionState: 'origin_aborted_before_result',
+  });
+  const resolution = await value.recovery.recoverWaiter({ wake: value.wake });
+  assert.equal(resolution.action, 'fallback');
+  assert.equal(resolution.inspection.state, 'origin_aborted_before_result');
+  assert.equal(value.receipts.length, 0);
+  assert.deepEqual(value.recoveredReturned, value.returned);
+  assert.equal(value.completionPosted, null);
 });
 
 test('recover_waiter keeps an exact local result silent while its origin is ambiguous', async () => {

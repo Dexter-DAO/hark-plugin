@@ -867,6 +867,7 @@ const CHILD_SOURCE = String.raw`
     'I_COMMIT_AUTHORITY',
     'I_COMMIT_CONTENDER',
     'W2',
+    'W3',
     'O0',
     'O1',
     'T0',
@@ -929,6 +930,31 @@ const CHILD_SOURCE = String.raw`
     });
     if (scenario === 'W2') {
       emit('observation_intent_durable');
+      await hold();
+    }
+
+    await import('node:fs/promises').then(({ appendFile }) => appendFile(
+      transcriptPath,
+      JSON.stringify({
+        timestamp: '2026-08-07T12:00:03.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'mcp_tool_call_end',
+          call_id: toolUseId,
+          invocation: {
+            server: 'hark',
+            tool: 'hark_await',
+            arguments: admission.rewrittenInput,
+          },
+          plugin_id: 'hark@hark',
+          read_only_hint: false,
+          duration: { secs: 86_400, nanos: 0 },
+          result: { Ok: result },
+        },
+      }) + '\n',
+    ));
+    if (scenario === 'W3') {
+      emit('mcp_tool_call_end_durable');
       await hold();
     }
 
@@ -1281,6 +1307,7 @@ const CHILD_SOURCE = String.raw`
   emit('wake_delivery_durable', {
     result: createToolWaitResult(delivered.wakeDelivery),
   });
+  if (scenario === 'W1D') await hold();
 `;
 
 function waitUntil(predicate, timeoutMs = 5_000) {
@@ -2741,7 +2768,11 @@ function recoveryWakeResult(api, disposition) {
   return result;
 }
 
-async function dispatchOneCrashRecoveryTurn(value, disposition) {
+async function dispatchOneCrashRecoveryTurn(
+  value,
+  disposition,
+  { reconcileBeforeDispatch = false } = {},
+) {
   value.api.targetedRecovery = true;
   value.api.targetDisposition = disposition;
   value.api.state = 'wake_pending';
@@ -2766,6 +2797,15 @@ async function dispatchOneCrashRecoveryTurn(value, disposition) {
     credentialsStore,
     readCredentials: () => credentialsStore.read(),
   });
+  if (reconcileBeforeDispatch) {
+    assert.deepEqual(await actualCertifier.reconcile(), {
+      posted: 0,
+      skipped: 0,
+      pending: 1,
+      failed: 0,
+      errors: [],
+    });
+  }
   const certifier = {
     protocol: value.protocol,
     setOriginAbortProofProvider(provider) {
@@ -2965,7 +3005,9 @@ async function crashScenario(scenario, { publishAbort = true, targetedRecovery =
         LIVE: 'suspension_committed_durable',
         W0: 'suspension_committed_durable',
         W1: 'wake_response_returned',
+        W1D: 'wake_delivery_durable',
         W2: 'observation_intent_durable',
+        W3: 'mcp_tool_call_end_durable',
         O0: 'observation_remote_accepted',
         O1: 'observation_remote_accepted',
         T0: 'tool_result_terminal_durable',
@@ -5083,13 +5125,15 @@ test('reconciler survives parent-owned arm, commit, and cancel response loss', {
   }
 });
 
-test('W0-W2: actual SIGKILL dispatches exactly one crash-recovery turn', {
+test('W0-W3 including W1D: actual SIGKILL dispatches exactly one crash-recovery turn', {
   timeout: 30_000,
 }, async (t) => {
   for (const [scenario, disposition] of [
     ['W0', 'recover_waiter'],
-    ['W1', 'recover_waiter'],
+    ['W1', 'recover_held_tool'],
+    ['W1D', 'recover_held_tool'],
     ['W2', 'recover_held_tool'],
+    ['W3', 'recover_held_tool'],
   ]) {
     await t.test(scenario, async () => {
       const crashed = await crashScenario(scenario);
@@ -5097,15 +5141,17 @@ test('W0-W2: actual SIGKILL dispatches exactly one crash-recovery turn', {
         assert.equal((await evaluateOrdinaryPrompt(crashed)).allowed, false);
         assert.equal((await runFreshReconciler(crashed)).kind, 'recovery_authorized');
         const beforeDelivery = await crashed.protocol.readWakeDelivery(crashed.request);
-        if (scenario === 'W2') {
+        if (['W1D', 'W2', 'W3'].includes(scenario)) {
           assert.ok(beforeDelivery);
-          assert.ok(await crashed.protocol.readToolResultObservationIntent(
+          const observationIntent = await crashed.protocol.readToolResultObservationIntent(
             beforeDelivery,
             undefined,
             undefined,
             undefined,
             undefined,
-          ));
+          );
+          if (scenario === 'W1D') assert.equal(observationIntent, null);
+          else assert.ok(observationIntent);
         } else {
           assert.equal(beforeDelivery, null);
         }
@@ -5113,7 +5159,9 @@ test('W0-W2: actual SIGKILL dispatches exactly one crash-recovery turn', {
           assert.equal(await crashed.protocol.readToolResultReturned(beforeDelivery), null);
         }
 
-        const recovery = await dispatchOneCrashRecoveryTurn(crashed, disposition);
+        const recovery = await dispatchOneCrashRecoveryTurn(crashed, disposition, {
+          reconcileBeforeDispatch: scenario === 'W3',
+        });
         assert.equal(recovery.appServer.callsFor('turn/start').length, 1);
         assert.equal(crashed.api.cancelApplyCount, 0);
         const receiptKinds = crashed.api.runtimeReceiptRequests.map((receipt) => receipt.kind);
@@ -5121,6 +5169,13 @@ test('W0-W2: actual SIGKILL dispatches exactly one crash-recovery turn', {
           ['wake_received', 'task_woken'].includes(kind)
         )), ['wake_received', 'task_woken']);
         assert.equal(receiptKinds.includes('tool_result_observed'), false);
+        if (['W1D', 'W3'].includes(scenario)) {
+          assert.equal(receiptKinds.includes('tool_result_not_persisted'), false);
+          assert.equal(
+            crashed.api.certification(TARGET_AWAIT_ID).activeToolResultObservationCount,
+            0,
+          );
+        }
         assert.equal((await crashed.protocol.listAwaitRequests()).length, 1);
       } finally {
         await crashed.api.stop();
