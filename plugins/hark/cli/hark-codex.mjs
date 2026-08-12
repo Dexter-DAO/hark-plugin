@@ -50,7 +50,7 @@ Commands:
   onboard  Complete first-run setup in the background, or keep Hark running.
   ensure   Start one background supervisor if this runtime is ready.
   run      Attach the Hark supervisor to the pinned Codex App Server daemon.
-  doctor   Verify credentials and the read-only Codex daemon/App Server gates.
+  doctor   Verify credentials, Codex sandbox execution, and App Server gates.
 
 Environment:
   HARK_API_URL    Hark API base URL (default: https://api.dexter.cash)
@@ -237,6 +237,64 @@ function configuredCodexCommand(options = {}, dependencies = {}) {
     ?? managedCodexPath(codexHome(options, dependencies));
 }
 
+const CODEX_SANDBOX_PERMISSION_PROFILES = Object.freeze([':read-only', ':workspace']);
+const CODEX_SANDBOX_TIMEOUT_MS = 5_000;
+const BWRAP_USER_NAMESPACE_FAILURES = Object.freeze([
+  'loopback: Failed RTM_NEWADDR: Operation not permitted',
+  'loopback: Failed RTM_NEWLINK: Operation not permitted',
+  'setting up uid map: Permission denied',
+  'No permissions to create a new namespace',
+]);
+
+function codexSandboxError(code, message, cause) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = code;
+  return error;
+}
+
+export function isCodexBubblewrapHostPolicyFailure(error) {
+  const text = typeof error?.stderr === 'string'
+    ? error.stderr
+    : error instanceof Error ? error.message : String(error ?? '');
+  return BWRAP_USER_NAMESPACE_FAILURES.some((marker) => text.includes(marker));
+}
+
+export async function verifyCodexSandbox(command, dependencies = {}) {
+  const execute = dependencies.runProcess ?? runProcess;
+  for (const permissionProfile of CODEX_SANDBOX_PERMISSION_PROFILES) {
+    try {
+      await execute(command, [
+        'sandbox',
+        '--disable',
+        'use_legacy_landlock',
+        '-P',
+        permissionProfile,
+        '--',
+        '/bin/true',
+      ], { timeoutMs: dependencies.timeoutMs ?? CODEX_SANDBOX_TIMEOUT_MS });
+    } catch (cause) {
+      const hostPolicyBlocked = isCodexBubblewrapHostPolicyFailure(cause);
+      throw codexSandboxError(
+        hostPolicyBlocked
+          ? 'CODEX_SANDBOX_USERNS_UNAVAILABLE'
+          : 'CODEX_SANDBOX_UNAVAILABLE',
+        hostPolicyBlocked
+          ? 'Codex bubblewrap is blocked by the host user-namespace policy. '
+            + 'Install Ubuntu bubblewrap, apparmor-profiles, and apparmor-utils, then load '
+            + 'bwrap-userns-restrict as documented at '
+            + 'https://learn.chatgpt.com/docs/sandboxing#prerequisites'
+          : `Codex sandbox execution failed for ${permissionProfile}`,
+        cause,
+      );
+    }
+  }
+  return {
+    status: 'ready',
+    backend: 'bubblewrap',
+    permissionProfiles: [...CODEX_SANDBOX_PERMISSION_PROFILES],
+  };
+}
+
 export async function createSupervisorRuntime(options = {}, dependencies = {}) {
   const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
   const journal = dependencies.journal ?? new HarkJournal(dataDir);
@@ -311,14 +369,36 @@ async function runProcess(command, args, dependencies = {}) {
     const child = spawnImpl(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    const maxOutputBytes = dependencies.maxOutputBytes ?? 65_536;
+    const append = (current, chunk) => `${current}${chunk}`.slice(-maxOutputBytes);
+    const timeoutMs = Number(dependencies.timeoutMs);
+    const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? setTimeout(() => {
+        timedOut = true;
+        child.kill?.('SIGKILL');
+      }, timeoutMs)
+      : null;
     child.stdout?.setEncoding?.('utf8');
     child.stderr?.setEncoding?.('utf8');
-    child.stdout?.on('data', (chunk) => { stdout += chunk; });
-    child.stderr?.on('data', (chunk) => { stderr += chunk; });
-    child.once('error', reject);
-    child.once('close', (code) => {
+    child.stdout?.on('data', (chunk) => { stdout = append(stdout, chunk); });
+    child.stderr?.on('data', (chunk) => { stderr = append(stderr, chunk); });
+    child.once('error', (error) => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`command_failed:${code}:${stderr.trim()}`));
+      else {
+        const error = new Error(`command_failed:${code}:${stderr.trim()}`);
+        error.code = timedOut ? 'COMMAND_TIMED_OUT' : 'COMMAND_FAILED';
+        error.exitCode = code;
+        error.signal = signal ?? null;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      }
     });
   });
 }
@@ -347,6 +427,9 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
       + CODEX_APP_SERVER_COMPATIBILITY.codexVersion,
     );
   }
+  const sandbox = await (dependencies.verifyCodexSandbox ?? verifyCodexSandbox)(command, {
+    runProcess: execute,
+  });
   // `bootstrap` launches Codex's detached auto-updater, which would silently
   // replace the certified runtime. Hark deliberately enables the setting and
   // starts the daemon through the two non-updating lifecycle commands.
@@ -364,6 +447,7 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
     codeModeHostSha256: runtime.codeModeHostSha256,
     bwrapPath: runtime.bwrapPath,
     bwrapSha256: runtime.bwrapSha256,
+    sandbox,
   };
 }
 
@@ -520,13 +604,38 @@ export async function doctorCommand(options = {}, dependencies = {}) {
   const command = configuredCodexCommand(options, dependencies);
   const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
   let runtimeStatus = null;
-  const daemonStatus = await check('codex_runtime', async () => {
+  await check('codex_runtime', async () => {
     runtimeStatus = await (
       dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime
     )(command);
-    return daemon.inspect();
+    return runtimeStatus;
   },
     'Re-run Hark setup to restore the pinned Codex runtime.');
+
+  let sandboxStatus = null;
+  if (runtimeStatus) {
+    sandboxStatus = await check('codex_sandbox', async () => (
+      (dependencies.verifyCodexSandbox ?? verifyCodexSandbox)(command, {
+        runProcess: dependencies.runProcess,
+      })
+    ), 'Install Ubuntu bubblewrap and load its scoped AppArmor profile, then re-run Hark setup.');
+  } else {
+    checks.push({
+      id: 'codex_sandbox', ok: false, error: 'codex_runtime_unavailable',
+      remediation: 'Restore the pinned Codex runtime first.',
+    });
+  }
+
+  let daemonStatus = null;
+  if (sandboxStatus) {
+    daemonStatus = await check('codex_daemon', async () => daemon.inspect(),
+      'Restart Hark setup and inspect the local Hark error log.');
+  } else {
+    checks.push({
+      id: 'codex_daemon', ok: false, error: 'codex_sandbox_unavailable',
+      remediation: 'Restore a working Codex sandbox first.',
+    });
+  }
 
   let appServer = null;
   let appServerReady = false;
@@ -786,6 +895,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
     } : null,
     daemon: daemonStatus,
     runtime: runtimeStatus,
+    sandbox: sandboxStatus,
     clockSource,
     supervisor: supervisorReady,
     checks,
@@ -799,8 +909,11 @@ function formatDoctorOutput(result) {
     `Daemon: ${result.daemon?.backend ?? 'unavailable'}`,
     `Managed artifact: ${result.daemon?.managedCodexSha256 ?? 'unavailable'}`,
     `Code-mode host: ${result.runtime?.codeModeHostSha256 ?? 'unavailable'}`,
-    `Bubblewrap: ${result.runtime?.bwrapPath ?? 'unavailable'}`,
-    `Bubblewrap SHA-256: ${result.runtime?.bwrapSha256 ?? 'unavailable'}`,
+    `Bundled bubblewrap fallback: ${result.runtime?.bwrapPath ?? 'unavailable'}`,
+    `Bundled bubblewrap SHA-256: ${result.runtime?.bwrapSha256 ?? 'unavailable'}`,
+    `Sandbox execution: ${result.sandbox?.status ?? 'unavailable'}`
+      + (result.sandbox?.backend ? ` (${result.sandbox.backend})` : ''),
+    `Sandbox profiles: ${result.sandbox?.permissionProfiles?.join(', ') ?? 'unavailable'}`,
     `Clock source: ${result.clockSource ?? 'unavailable'}`,
     `Hark installation: ${result.connected ? 'connected' : 'not connected'}`,
     ...result.checks.filter((check) => !check.ok).map(

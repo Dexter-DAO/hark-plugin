@@ -4,10 +4,10 @@ Public distribution of the Hark durable-await plugin for Codex.
 
 Hark lets one Codex task stop inference while it waits for an authenticated external event, then resume the same originating tool call exactly once.
 
-## Install v0.1.4
+## Install v0.1.5
 
 ```sh
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.4
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.5
 codex plugin add hark@hark
 ```
 
@@ -23,14 +23,21 @@ sibling, and the official bundled Bubblewrap helper used by Codex's normal
 Linux sandbox profiles. It repairs missing companions without replacing
 already-verified runtime files.
 
+Setup and doctor also execute Codex's read-only and workspace Bubblewrap
+profiles. Ubuntu 24.04 hosts that restrict unprivileged user namespaces must
+load the scoped system profile described in the
+[Codex sandbox prerequisites](https://learn.chatgpt.com/docs/sandboxing#prerequisites).
+Hark does not disable the global restriction or silently switch to deprecated
+legacy Landlock.
+
 The plugin talks to the public Hark service through `https://api.dexter.cash` and `https://hark.sh`.
 
 This repository is a release-only distribution mirror. Hark is proprietary software (`LicenseRef-Proprietary`); no open-source license is granted.
 
 Release provenance:
 
-- Hark release: `afa285ccdcce-0cfd564cd779`
-- Source commit: `afa285ccdcce7075db9652ed82b7ba64ee2227d7`
-- Source tree: `ab6ecdc5259c67e923bfb337b2b1432b63cdcb8a`
-- Artifact digest: `0cfd564cd779c6e23bd06711cc244169b789b971ece1f418cf7238156dd32268`
-- Plugin digest: `3e38cca6c4e5f36a7ea51d03ea13527c66270529342bd7ef86178cd4e4482477`
+- Hark release: `02cd06aa450c-ac53280e79a2`
+- Source commit: `02cd06aa450c054c3a32559bc65edcaa278696e8`
+- Source tree: `236b48c5525234ae16eb0537999c915e40fab566`
+- Artifact digest: `ac53280e79a232603b134186936f1b88a102455d0ea2c01d5bea4c64dad2aa15`
+- Plugin digest: `f1da44a6ec186f5d03e93a16a560e1ec120c5c2509cfefb3576f14f9d0d07d98`

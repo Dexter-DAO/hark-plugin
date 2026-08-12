@@ -17,7 +17,7 @@ are never model inputs. The parent package includes the Codex adapter.
 Add this repository as a Codex plugin marketplace and install **Hark**:
 
 ```bash
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.4
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.5
 codex plugin add hark@hark
 ```
 
@@ -33,6 +33,25 @@ Hark setup pins and verifies the Codex 0.147 executable, its required
 `codex-code-mode-host` sibling, and the official bundled Bubblewrap helper used
 by Codex's normal Linux sandbox profiles. Existing installations missing a
 companion are repaired without replacing already-verified runtime files.
+
+Setup and doctor also execute both Codex `:read-only` and `:workspace`
+sandbox profiles with deprecated legacy Landlock explicitly disabled. On
+Ubuntu 24.04, a host that restricts unprivileged user namespaces needs the
+scoped system Bubblewrap AppArmor profile documented in the
+[Codex sandbox prerequisites](https://learn.chatgpt.com/docs/sandboxing#prerequisites):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y bubblewrap apparmor-profiles apparmor-utils
+sudo install -m 0644 \
+  /usr/share/apparmor/extra-profiles/bwrap-userns-restrict \
+  /etc/apparmor.d/bwrap-userns-restrict
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+Hark never disables the global AppArmor restriction, enables setuid Bubblewrap,
+or silently switches Codex to deprecated legacy Landlock. Setup stops before
+daemon mutation until both functional sandbox probes pass.
 
 The command visibly prints both fields needed by a headless Linux install:
 

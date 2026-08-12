@@ -13,8 +13,11 @@ import {
   ensureCommand,
   formatDoctorOutput,
   formatDeviceVerification,
+  isCodexBubblewrapHostPolicyFailure,
   onboardCommand,
   parseArgs,
+  runProcess,
+  verifyCodexSandbox,
   wait,
 } from '../cli/hark-codex.mjs';
 import { HarkCredentialsStore } from '../lib/credentials.mjs';
@@ -48,6 +51,30 @@ test('successful CLI delays remove their abort listener', async () => {
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
 });
 
+test('process runner returns bounded structured failures and enforces its timeout', async () => {
+  await assert.rejects(runProcess(process.execPath, [
+    '-e',
+    'process.stdout.write("out"); process.stderr.write("err"); process.exit(7);',
+  ]), (error) => {
+    assert.equal(error.code, 'COMMAND_FAILED');
+    assert.equal(error.exitCode, 7);
+    assert.equal(error.signal, null);
+    assert.equal(error.stdout, 'out');
+    assert.equal(error.stderr, 'err');
+    return true;
+  });
+
+  await assert.rejects(runProcess(process.execPath, [
+    '-e',
+    'setTimeout(() => undefined, 1_000);',
+  ], { timeoutMs: 20 }), (error) => {
+    assert.equal(error.code, 'COMMAND_TIMED_OUT');
+    assert.equal(error.exitCode, null);
+    assert.equal(error.signal, 'SIGKILL');
+    return true;
+  });
+});
+
 test('setup verifies the pinned binary before non-updating daemon lifecycle mutations', async () => {
   const calls = [];
   const verified = [];
@@ -73,6 +100,12 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
   assert.deepEqual(verified, ['/opt/codex-0.147.0']);
   assert.deepEqual(calls, [
     ['/opt/codex-0.147.0', ['--version']],
+    ['/opt/codex-0.147.0', [
+      'sandbox', '--disable', 'use_legacy_landlock', '-P', ':read-only', '--', '/bin/true',
+    ]],
+    ['/opt/codex-0.147.0', [
+      'sandbox', '--disable', 'use_legacy_landlock', '-P', ':workspace', '--', '/bin/true',
+    ]],
     ['/opt/codex-0.147.0', ['app-server', 'daemon', 'enable-remote-control']],
     ['/opt/codex-0.147.0', ['app-server', 'daemon', 'start']],
   ]);
@@ -82,6 +115,95 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
   assert.equal(status.codeModeHostSha256, 'host-sha256');
   assert.equal(status.bwrapPath, '/opt/codex-resources/bwrap');
   assert.equal(status.bwrapSha256, 'bwrap-sha256');
+  assert.deepEqual(status.sandbox, {
+    status: 'ready', backend: 'bubblewrap',
+    permissionProfiles: [':read-only', ':workspace'],
+  });
+});
+
+test('sandbox verification forces modern bubblewrap for both certified permission profiles', async () => {
+  const calls = [];
+  const result = await verifyCodexSandbox('/opt/codex-0.147.0', {
+    runProcess: async (command, args, options) => {
+      calls.push({ command, args, options });
+      return { stdout: '', stderr: '' };
+    },
+  });
+  assert.deepEqual(result, {
+    status: 'ready', backend: 'bubblewrap',
+    permissionProfiles: [':read-only', ':workspace'],
+  });
+  assert.deepEqual(calls.map(({ args }) => args), [
+    ['sandbox', '--disable', 'use_legacy_landlock', '-P', ':read-only', '--', '/bin/true'],
+    ['sandbox', '--disable', 'use_legacy_landlock', '-P', ':workspace', '--', '/bin/true'],
+  ]);
+  assert.equal(calls.every(({ options }) => options.timeoutMs === 5_000), true);
+});
+
+test('sandbox verification classifies only the exact bubblewrap user-namespace failures', async (t) => {
+  const markers = [
+    'loopback: Failed RTM_NEWADDR: Operation not permitted',
+    'loopback: Failed RTM_NEWLINK: Operation not permitted',
+    'setting up uid map: Permission denied',
+    'No permissions to create a new namespace',
+  ];
+  for (const marker of markers) {
+    await t.test(marker, async () => {
+      const cause = Object.assign(new Error('command_failed'), {
+        code: 'COMMAND_FAILED', stderr: `bwrap: ${marker}\n`, exitCode: 1,
+      });
+      assert.equal(isCodexBubblewrapHostPolicyFailure(cause), true);
+      await assert.rejects(verifyCodexSandbox('/opt/codex-0.147.0', {
+        runProcess: async () => { throw cause; },
+      }), (error) => {
+        assert.equal(error.code, 'CODEX_SANDBOX_USERNS_UNAVAILABLE');
+        assert.equal(error.message.includes(marker), false);
+        assert.match(error.message, /learn\.chatgpt\.com\/docs\/sandboxing/);
+        return true;
+      });
+    });
+  }
+  const nearMiss = Object.assign(new Error('command_failed'), {
+    stderr: 'bwrap: unrelated operation failed: Operation not permitted\n',
+  });
+  assert.equal(isCodexBubblewrapHostPolicyFailure(nearMiss), false);
+  await assert.rejects(verifyCodexSandbox('/opt/codex-0.147.0', {
+    runProcess: async () => { throw nearMiss; },
+  }), (error) => error?.code === 'CODEX_SANDBOX_UNAVAILABLE');
+});
+
+test('setup performs no daemon mutation when functional sandbox verification fails', async () => {
+  const calls = [];
+  await assert.rejects(bootstrapDaemonCommand({ codex: '/opt/codex-0.147.0' }, {
+    verifyPinnedCodexRuntime: async () => ({
+      path: '/opt/codex-0.147.0',
+      codeModeHostPath: '/opt/codex-code-mode-host',
+      codeModeHostSha256: 'host-sha256',
+      bwrapPath: '/opt/codex-resources/bwrap',
+      bwrapSha256: 'bwrap-sha256',
+    }),
+    runProcess: async (command, args) => {
+      calls.push([command, args]);
+      if (args[0] === '--version') return { stdout: 'codex-cli 0.147.0\n', stderr: '' };
+      const error = Object.assign(new Error('command_failed'), {
+        code: 'COMMAND_FAILED',
+        stderr: 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n',
+      });
+      throw error;
+    },
+    daemonTransport: {
+      async inspect() {
+        calls.push(['daemon.inspect']);
+        return {};
+      },
+    },
+  }), (error) => error?.code === 'CODEX_SANDBOX_USERNS_UNAVAILABLE');
+  assert.deepEqual(calls, [
+    ['/opt/codex-0.147.0', ['--version']],
+    ['/opt/codex-0.147.0', [
+      'sandbox', '--disable', 'use_legacy_landlock', '-P', ':read-only', '--', '/bin/true',
+    ]],
+  ]);
 });
 
 test('setup performs no Codex or daemon command when the sibling host fails verification', async () => {
@@ -417,7 +539,7 @@ function certifiedHooks() {
 }
 
 function doctorFixture(overrides = {}) {
-  const state = { closed: false };
+  const state = { closed: false, daemonInspections: 0 };
   const credentials = {
     apiBaseUrl: 'https://api.example.test',
     accessToken: 'hki_secret',
@@ -460,7 +582,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.4' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.5' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -483,7 +605,17 @@ function doctorFixture(overrides = {}) {
       credentialsStore: { read: async () => credentials },
       verifyPinnedCodexRuntime: overrides.verifyPinnedCodexRuntime
         ?? (async () => runtime),
-      daemonTransport: { inspect: async () => daemon },
+      verifyCodexSandbox: overrides.verifyCodexSandbox
+        ?? (async () => ({
+          status: 'ready', backend: 'bubblewrap',
+          permissionProfiles: [':read-only', ':workspace'],
+        })),
+      daemonTransport: {
+        inspect: async () => {
+          state.daemonInspections += 1;
+          return daemon;
+        },
+      },
       appServerClient,
       serviceClient: {
         async getInstallationStatus() {
@@ -503,7 +635,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.4', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.5', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -524,7 +656,11 @@ test('doctor certifies the exact held-call hooks and effective MCP config', asyn
   assert.equal(result.clockSource, 'system');
   assert.equal(result.daemon.managedCodexSha256, fixture.daemon.managedCodexSha256);
   assert.deepEqual(result.runtime, fixture.runtime);
-  assert.equal(result.checks.length, 11);
+  assert.deepEqual(result.sandbox, {
+    status: 'ready', backend: 'bubblewrap',
+    permissionProfiles: [':read-only', ':workspace'],
+  });
+  assert.equal(result.checks.length, 13);
   assert.deepEqual(result.checks.find((check) => check.id === 'hooks').detail, [
     'PostToolUse', 'PreToolUse', 'SessionStart', 'UserPromptSubmit',
   ]);
@@ -536,18 +672,26 @@ test('doctor certifies the exact held-call hooks and effective MCP config', asyn
   assert.equal(fixture.state.closed, true);
 });
 
-test('plain doctor output reports the exact pinned bubblewrap path and digest', () => {
+test('plain doctor output distinguishes the bundled fallback from functional sandbox proof', () => {
   const fixture = doctorFixture();
   const output = formatDoctorOutput({
     ok: true,
     daemon: fixture.daemon,
     runtime: fixture.runtime,
+    sandbox: {
+      status: 'ready', backend: 'bubblewrap',
+      permissionProfiles: [':read-only', ':workspace'],
+    },
     clockSource: 'system',
     connected: true,
     checks: [],
   });
-  assert.equal(output.includes(`Bubblewrap: ${fixture.runtime.bwrapPath}\n`), true);
-  assert.equal(output.includes(`Bubblewrap SHA-256: ${fixture.runtime.bwrapSha256}\n`), true);
+  assert.equal(output.includes(`Bundled bubblewrap fallback: ${fixture.runtime.bwrapPath}\n`), true);
+  assert.equal(output.includes(
+    `Bundled bubblewrap SHA-256: ${fixture.runtime.bwrapSha256}\n`,
+  ), true);
+  assert.equal(output.includes('Sandbox execution: ready (bubblewrap)\n'), true);
+  assert.equal(output.includes('Sandbox profiles: :read-only, :workspace\n'), true);
   assert.equal(output.endsWith('\n'), true);
 });
 
@@ -592,6 +736,33 @@ test('doctor fails before App Server work when bubblewrap is unavailable', async
     result.checks.find((check) => check.id === 'app_server').error,
     'codex_runtime_unavailable',
   );
+  assert.equal(fixture.state.closed, false);
+});
+
+test('doctor fails closed before daemon or App Server work when sandbox execution is blocked', async () => {
+  const fixture = doctorFixture({
+    verifyCodexSandbox: async () => {
+      const error = new Error('Codex bubblewrap is blocked by the host user-namespace policy');
+      error.code = 'CODEX_SANDBOX_USERNS_UNAVAILABLE';
+      throw error;
+    },
+  });
+  const result = await doctorCommand({}, fixture.dependencies);
+  assert.equal(result.ok, false);
+  assert.equal(result.sandbox, null);
+  assert.equal(
+    result.checks.find((check) => check.id === 'codex_sandbox').error,
+    'CODEX_SANDBOX_USERNS_UNAVAILABLE',
+  );
+  assert.equal(
+    result.checks.find((check) => check.id === 'codex_daemon').error,
+    'codex_sandbox_unavailable',
+  );
+  assert.equal(
+    result.checks.find((check) => check.id === 'app_server').error,
+    'codex_runtime_unavailable',
+  );
+  assert.equal(fixture.state.daemonInspections, 0);
   assert.equal(fixture.state.closed, false);
 });
 
@@ -855,7 +1026,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.4', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.5', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);

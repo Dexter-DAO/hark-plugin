@@ -1,6 +1,6 @@
 {
   "name": "hark",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Durable external waits and exact-task continuation for AI agents.",
   "author": {
     "name": "Dexter",
