@@ -86,9 +86,11 @@ function requireAbsolutePath(value, label) {
   return value;
 }
 
-function defaultVersionProbe({ command, commandArgs, spawnImpl }) {
+function defaultVersionProbe({ command, commandArgs, spawnImpl, cwd, env }) {
   return new Promise((resolve, reject) => {
     const child = spawnImpl(command, [...commandArgs, '--version'], {
+      cwd,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -154,6 +156,8 @@ export class AppServerClient extends EventEmitter {
       command: this.command,
       commandArgs: this.commandArgs,
       spawnImpl: this.spawnImpl,
+      cwd: this.cwd,
+      env: this.env,
     }));
     this.expectedVersion = options.expectedVersion ?? CODEX_APP_SERVER_COMPATIBILITY.codexVersion;
     this.expectedSchemaDigest = options.expectedSchemaDigest
@@ -162,7 +166,7 @@ export class AppServerClient extends EventEmitter {
     this.clientInfo = options.clientInfo ?? {
       name: 'hark-codex-supervisor',
       title: 'Hark Codex Supervisor',
-      version: '0.1.6',
+      version: '0.1.7',
     };
 
     this.transport = null;

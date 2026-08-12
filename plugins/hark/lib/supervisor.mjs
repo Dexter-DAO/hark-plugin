@@ -374,24 +374,31 @@ export class HarkCodexSupervisor extends EventEmitter {
     if (!this.running && !this.pollPromise) return;
     this.running = false;
     this.pollAbort?.abort();
+    const settled = await Promise.allSettled([
+      this.pollPromise,
+      this.hookPollPromise,
+      this.heldWaitCertifierPromise,
+      this.heldCrashRecoveryPromise,
+    ].filter(Boolean));
+    let failure = settled.find((result) => (
+      result.status === 'rejected' && result.reason?.name !== 'AbortError'
+    ))?.reason ?? null;
+    this.pollPromise = null;
+    this.hookPollPromise = null;
+    this.heldWaitCertifierPromise = null;
+    this.heldCrashRecoveryPromise = null;
+    this.pollAbort = null;
     try {
-      await Promise.all([
-        this.pollPromise,
-        this.hookPollPromise,
-        this.heldWaitCertifierPromise,
-        this.heldCrashRecoveryPromise,
-      ].filter(Boolean));
+      await this.drain();
     } catch (error) {
-      if (error?.name !== 'AbortError') throw error;
-    } finally {
-      this.pollPromise = null;
-      this.hookPollPromise = null;
-      this.heldWaitCertifierPromise = null;
-      this.heldCrashRecoveryPromise = null;
-      this.pollAbort = null;
+      failure ??= error;
     }
-    await this.drain();
-    this.emit('close');
+    try {
+      this.emit('close');
+    } catch (error) {
+      failure ??= error;
+    }
+    if (failure) throw failure;
   }
 
   assertHealthy() {
@@ -1614,7 +1621,11 @@ export class HarkCodexSupervisor extends EventEmitter {
       && existing.claim?.leaseGeneration === claim.leaseGeneration
       && !['needs_reclaim'].includes(existing.state)
     ) {
-      await this.#recoverWake(existing);
+      // An explicit replay is serialized by this supervisor's event queue and
+      // carries exact claim identity. It may classify a previously persisted
+      // global intent as uncertain even though periodic polling may not infer
+      // owner death from the same intermediate journal state.
+      await this.#recoverWake(existing, { allowExplicitReplayRecovery: true });
       return;
     }
     const recovery = heldCrashRecovery
@@ -2452,7 +2463,14 @@ export class HarkCodexSupervisor extends EventEmitter {
     }
     state = await this.journal.read();
     for (const wakeRecord of Object.values(state.wakes)) {
-      if (!TERMINAL_WAKE_STATES.has(wakeRecord.state)) await this.#recoverWake(wakeRecord);
+      if (!TERMINAL_WAKE_STATES.has(wakeRecord.state)) {
+        // The CLI acquires the kernel-owned singleton process lock before
+        // constructing a supervisor. Startup is therefore the one point where
+        // an unfinished pre-host-call dispatch can be known to have lost its
+        // previous owner. Periodic reconciliation has no such owner-death
+        // proof and must not rewind a live dispatch.
+        await this.#recoverWake(wakeRecord, { allowPreHostCrashRecovery: true });
+      }
     }
     state = await this.journal.read();
     for (const violation of Object.values(state.violations)) {
@@ -2488,8 +2506,21 @@ export class HarkCodexSupervisor extends EventEmitter {
     }
   }
 
-  async #recoverWake(wakeRecord) {
+  async #recoverWake(wakeRecord, {
+    allowPreHostCrashRecovery = false,
+    allowExplicitReplayRecovery = false,
+  } = {}) {
     if (wakeRecord.state === 'needs_reclaim') return;
+    // `dispatching` is the locally owned interval from the durable journal
+    // transition through global intent publication and host-call submission.
+    // A periodic loop (including one in a second supervisor) cannot distinguish
+    // that live interval from a dead owner. Only startup under the process lock
+    // may reconcile it.
+    if (
+      wakeRecord.state === 'dispatching'
+      && !allowPreHostCrashRecovery
+      && !allowExplicitReplayRecovery
+    ) return;
     const dispatchFenceSnapshot = await this.#readWakeDispatchFence(wakeRecord);
     if (
       dispatchFenceSnapshot.intent
@@ -2530,7 +2561,10 @@ export class HarkCodexSupervisor extends EventEmitter {
         }
         return;
       }
-      if (['dispatching', 'dispatch_uncertain'].includes(wakeRecord.state)) {
+      if (
+        allowPreHostCrashRecovery
+        && ['dispatching', 'dispatch_uncertain'].includes(wakeRecord.state)
+      ) {
         // The global intent is durably published before turn/start. Its
         // absence is therefore positive evidence that no host call could have
         // been issued, even if the process died after reserving the fence.

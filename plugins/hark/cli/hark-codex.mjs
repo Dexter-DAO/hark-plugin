@@ -237,6 +237,20 @@ function configuredCodexCommand(options = {}, dependencies = {}) {
     ?? managedCodexPath(codexHome(options, dependencies));
 }
 
+async function prepareCodexRuntimeCwd(options = {}, dependencies = {}) {
+  const runtimeCwd = path.resolve(
+    dependencies.runtimeCwd ?? codexHome(options, dependencies),
+  );
+  await mkdir(runtimeCwd, { recursive: true, mode: 0o700 });
+  return {
+    runtimeCwd,
+    runtimeEnv: {
+      ...(dependencies.env ?? process.env),
+      PWD: runtimeCwd,
+    },
+  };
+}
+
 const HARK_DIRECT_TOOL_NAMESPACE = 'mcp__hark';
 const HARK_DIRECT_TOOL_NAMESPACE_KEY = 'features.code_mode.direct_only_tool_namespaces';
 
@@ -268,11 +282,12 @@ function directOnlyToolNamespaces(config, { requireHark = false } = {}) {
 }
 
 function configClient(command, dependencies = {}) {
+  const cwd = dependencies.runtimeCwd ?? dependencies.cwd;
   const factory = dependencies.configAppServerClientFactory;
-  if (typeof factory === 'function') return factory({ command });
+  if (typeof factory === 'function') return factory({ command, cwd });
   return new AppServerClient({
     command,
-    cwd: dependencies.cwd,
+    cwd,
     env: dependencies.env ?? process.env,
   });
 }
@@ -282,7 +297,10 @@ async function readCodexConfig(command, dependencies = {}, { includeLayers = fal
   try {
     const initialized = await client.start();
     const result = await client.readConfig({
-      cwd: dependencies.cwd ?? process.cwd(),
+      cwd: dependencies.configCwd
+        ?? dependencies.runtimeCwd
+        ?? dependencies.cwd
+        ?? process.cwd(),
       includeLayers,
     });
     return { initialized, result };
@@ -308,7 +326,10 @@ export async function ensureHarkDirectToolNamespace(command, dependencies = {}) 
   try {
     const initialized = await client.start();
     const result = await client.readConfig({
-      cwd: dependencies.cwd ?? process.cwd(),
+      cwd: dependencies.configCwd
+        ?? dependencies.runtimeCwd
+        ?? dependencies.cwd
+        ?? process.cwd(),
       includeLayers: true,
     });
     namespaces = directOnlyToolNamespaces(result.config);
@@ -398,7 +419,11 @@ export async function verifyCodexSandbox(command, dependencies = {}) {
         permissionProfile,
         '--',
         '/bin/true',
-      ], { timeoutMs: dependencies.timeoutMs ?? CODEX_SANDBOX_TIMEOUT_MS });
+      ], {
+        timeoutMs: dependencies.timeoutMs ?? CODEX_SANDBOX_TIMEOUT_MS,
+        cwd: dependencies.runtimeCwd ?? dependencies.cwd,
+        env: dependencies.env,
+      });
     } catch (cause) {
       const hostPolicyBlocked = isCodexBubblewrapHostPolicyFailure(cause);
       throw codexSandboxError(
@@ -424,6 +449,10 @@ export async function verifyCodexSandbox(command, dependencies = {}) {
 
 export async function createSupervisorRuntime(options = {}, dependencies = {}) {
   const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
+  const { runtimeCwd, runtimeEnv } = await prepareCodexRuntimeCwd(options, dependencies);
+  const runtimeDependencies = {
+    ...dependencies, dataDir, runtimeCwd, env: runtimeEnv,
+  };
   const journal = dependencies.journal ?? new HarkJournal(dataDir);
   const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
   const credentials = await credentialsStore.read();
@@ -434,14 +463,23 @@ export async function createSupervisorRuntime(options = {}, dependencies = {}) {
   await (dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime)(command);
   await (dependencies.verifyHarkDirectToolNamespace ?? verifyHarkDirectToolNamespace)(
     command,
-    dependencies,
+    runtimeDependencies,
   );
   const transportFactory = dependencies.transportFactory
-    ?? createCodexDaemonTransportFactory({ command });
+    ?? createCodexDaemonTransportFactory({
+      command,
+      cwd: runtimeCwd,
+      env: runtimeEnv,
+    });
   const appServerClientFactory = dependencies.appServerClientFactory
     ?? (dependencies.appServerClient
       ? () => dependencies.appServerClient
-      : () => new AppServerClient({ command, transportFactory }));
+      : () => new AppServerClient({
+        command,
+        transportFactory,
+        cwd: runtimeCwd,
+        env: runtimeEnv,
+      }));
   const service = dependencies.serviceClient ?? new HarkServiceClient({
     baseUrl: credentials.apiBaseUrl,
     accessToken: credentials.accessToken,
@@ -497,7 +535,11 @@ export async function runCommand(options = {}, dependencies = {}) {
 async function runProcess(command, args, dependencies = {}) {
   const spawnImpl = dependencies.spawnImpl ?? spawn;
   return new Promise((resolve, reject) => {
-    const child = spawnImpl(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawnImpl(command, args, {
+      cwd: dependencies.cwd,
+      env: dependencies.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -535,6 +577,10 @@ async function runProcess(command, args, dependencies = {}) {
 }
 
 export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
+  const { runtimeCwd, runtimeEnv } = await prepareCodexRuntimeCwd(options, dependencies);
+  const runtimeDependencies = {
+    ...dependencies, runtimeCwd, configCwd: runtimeCwd, env: runtimeEnv,
+  };
   const explicitCommand = options.codex ?? process.env.HARK_CODEX_BIN ?? null;
   let command;
   if (explicitCommand) {
@@ -549,7 +595,8 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
     dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime
   )(command);
   const execute = dependencies.runProcess ?? runProcess;
-  const versionResult = await execute(command, ['--version']);
+  const processOptions = { cwd: runtimeCwd, env: runtimeEnv };
+  const versionResult = await execute(command, ['--version'], processOptions);
   const versionOutput = `${versionResult?.stdout ?? ''}\n${versionResult?.stderr ?? ''}`;
   const actualVersion = versionOutput.match(/(?:codex-cli\s+)?(\d+\.\d+\.\d+)/)?.[1] ?? null;
   if (actualVersion !== CODEX_APP_SERVER_COMPATIBILITY.codexVersion) {
@@ -560,23 +607,48 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
   }
   const sandbox = await (dependencies.verifyCodexSandbox ?? verifyCodexSandbox)(command, {
     runProcess: execute,
+    runtimeCwd,
+    env: runtimeEnv,
   });
-  const directToolNamespace = await (
+  await (
     dependencies.ensureHarkDirectToolNamespace ?? ensureHarkDirectToolNamespace
-  )(command, dependencies);
+  )(command, runtimeDependencies);
   // `bootstrap` launches Codex's detached auto-updater, which would silently
   // replace the certified runtime. Hark deliberately enables the setting and
   // starts the daemon through the two non-updating lifecycle commands.
-  await execute(command, ['app-server', 'daemon', 'enable-remote-control']);
-  await execute(command, ['app-server', 'daemon', 'start']);
-  if (directToolNamespace.changed) {
-    await execute(command, ['app-server', 'daemon', 'restart']);
-  }
-  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
+  await execute(
+    command,
+    ['app-server', 'daemon', 'enable-remote-control'],
+    processOptions,
+  );
+  await execute(command, ['app-server', 'daemon', 'start'], processOptions);
+  // `start` leaves an existing daemon untouched, including an unsafe cwd it
+  // inherited from a refreshable plugin cache. Always replace that process so
+  // the managed App Server owns the stable CODEX_HOME cwd above.
+  await execute(command, ['app-server', 'daemon', 'restart'], processOptions);
+  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({
+    command,
+    cwd: runtimeCwd,
+    env: runtimeEnv,
+  });
   const inspection = await daemon.inspect();
   if (inspection.managedCodexPath && inspection.managedCodexPath !== command) {
     throw new Error('codex_managed_path_mismatch');
   }
+  const restartedTransportFactory = dependencies.restartedTransportFactory
+    ?? createCodexDaemonTransportFactory({ command, cwd: runtimeCwd, env: runtimeEnv });
+  const verifyRestarted = dependencies.verifyRestartedHarkDirectToolNamespace
+    ?? verifyHarkDirectToolNamespace;
+  const restartedDirectToolNamespace = await verifyRestarted(command, {
+    ...runtimeDependencies,
+    configAppServerClientFactory: dependencies.restartedConfigAppServerClientFactory
+      ?? (() => new AppServerClient({
+        command,
+        cwd: runtimeCwd,
+        env: runtimeEnv,
+        transportFactory: restartedTransportFactory,
+      })),
+  });
   return {
     ...inspection,
     harkCodexPath: command,
@@ -585,7 +657,7 @@ export async function bootstrapDaemonCommand(options = {}, dependencies = {}) {
     bwrapPath: runtime.bwrapPath,
     bwrapSha256: runtime.bwrapSha256,
     sandbox,
-    directToolNamespace,
+    directToolNamespace: restartedDirectToolNamespace,
   };
 }
 
@@ -594,12 +666,16 @@ export async function ensureCommand(options = {}, dependencies = {}) {
   const credentialsStore = dependencies.credentialsStore ?? new HarkCredentialsStore(dataDir);
   const credentials = await credentialsStore.read();
   if (!credentials) return { started: false, reason: 'not_connected' };
+  const { runtimeCwd, runtimeEnv } = await prepareCodexRuntimeCwd(options, dependencies);
+  const runtimeDependencies = {
+    ...dependencies, dataDir, runtimeCwd, env: runtimeEnv,
+  };
   const command = configuredCodexCommand(options, dependencies);
   try {
     await (dependencies.verifyPinnedCodexRuntime ?? verifyPinnedCodexRuntime)(command);
     await (dependencies.verifyHarkDirectToolNamespace ?? verifyHarkDirectToolNamespace)(
       command,
-      dependencies,
+      runtimeDependencies,
     );
   } catch (error) {
     return { started: false, reason: error?.code ?? 'runtime_incomplete' };
@@ -625,7 +701,11 @@ export async function ensureCommand(options = {}, dependencies = {}) {
       ready: Boolean(ready),
     };
   }
-  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
+  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({
+    command,
+    cwd: runtimeCwd,
+    env: runtimeEnv,
+  });
   try {
     await daemon.inspect();
   } catch (error) {
@@ -637,8 +717,9 @@ export async function ensureCommand(options = {}, dependencies = {}) {
   const spawnImpl = dependencies.spawnImpl ?? spawn;
   try {
     const child = spawnImpl(process.execPath, [script, 'run', '--codex', command], {
+      cwd: runtimeCwd,
       detached: true,
-      env: { ...process.env, HARK_DATA_DIR: dataDir },
+      env: { ...runtimeEnv, HARK_DATA_DIR: dataDir },
       stdio: ['ignore', logs.stdout, logs.stderr],
     });
     child.unref?.();
@@ -670,6 +751,7 @@ export async function onboardCommand(options = {}, dependencies = {}) {
   }
 
   await mkdir(onboardingDir, { recursive: true, mode: 0o700 });
+  const { runtimeCwd, runtimeEnv } = await prepareCodexRuntimeCwd(options, dependencies);
   const logs = dependencies.logs ?? openSupervisorLogs(onboardingDir);
   const script = fileURLToPath(import.meta.url);
   const args = [script, 'setup'];
@@ -680,8 +762,9 @@ export async function onboardCommand(options = {}, dependencies = {}) {
   const spawnImpl = dependencies.spawnImpl ?? spawn;
   try {
     const child = spawnImpl(process.execPath, args, {
+      cwd: runtimeCwd,
       detached: true,
-      env: { ...process.env, HARK_DATA_DIR: dataDir },
+      env: { ...runtimeEnv, HARK_DATA_DIR: dataDir },
       stdio: ['ignore', logs.stdout, logs.stderr],
     });
     child.unref?.();
@@ -702,6 +785,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
   const pluginRoot = dependencies.pluginRoot ?? CODEX_PLUGIN_ROOT;
   const hookContract = certifiedHookContract(pluginRoot);
   const dataDir = dependencies.dataDir ?? defaultHarkDataDir();
+  const { runtimeCwd, runtimeEnv } = await prepareCodexRuntimeCwd(options, dependencies);
   const checks = [];
   const check = async (id, operation, remediation) => {
     try {
@@ -744,7 +828,11 @@ export async function doctorCommand(options = {}, dependencies = {}) {
     };
   }, 'Approve the Hark installation in the browser.');
   const command = configuredCodexCommand(options, dependencies);
-  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({ command });
+  const daemon = dependencies.daemonTransport ?? new CodexDaemonTransport({
+    command,
+    cwd: runtimeCwd,
+    env: runtimeEnv,
+  });
   let runtimeStatus = null;
   await check('codex_runtime', async () => {
     runtimeStatus = await (
@@ -759,6 +847,8 @@ export async function doctorCommand(options = {}, dependencies = {}) {
     sandboxStatus = await check('codex_sandbox', async () => (
       (dependencies.verifyCodexSandbox ?? verifyCodexSandbox)(command, {
         runProcess: dependencies.runProcess,
+        runtimeCwd,
+        env: runtimeEnv,
       })
     ), 'Install Ubuntu bubblewrap and load its scoped AppArmor profile, then re-run Hark setup.');
   } else {
@@ -783,9 +873,18 @@ export async function doctorCommand(options = {}, dependencies = {}) {
   let appServerReady = false;
   if (daemonStatus) {
     const transportFactory = dependencies.transportFactory
-      ?? createCodexDaemonTransportFactory({ command });
+      ?? createCodexDaemonTransportFactory({
+        command,
+        cwd: runtimeCwd,
+        env: runtimeEnv,
+      });
     appServer = dependencies.appServerClient
-      ?? new AppServerClient({ command, transportFactory });
+      ?? new AppServerClient({
+        command,
+        transportFactory,
+        cwd: runtimeCwd,
+        env: runtimeEnv,
+      });
     await check('app_server', async () => {
       await appServer.start();
       appServerReady = true;
@@ -809,7 +908,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
           throw new Error('codex_config_read_unavailable');
         }
         const result = await appServer.readConfig({
-          cwd: dependencies.cwd ?? process.cwd(),
+          cwd: dependencies.cwd ?? runtimeCwd,
           includeLayers: false,
         });
         if (!result?.config || typeof result.config !== 'object' || Array.isArray(result.config)) {
@@ -841,7 +940,7 @@ export async function doctorCommand(options = {}, dependencies = {}) {
       if (typeof appServer.listHooks !== 'function') {
         throw new Error('codex_hooks_list_unavailable');
       }
-      const result = await appServer.listHooks({ cwds: [dependencies.cwd ?? process.cwd()] });
+      const result = await appServer.listHooks({ cwds: [dependencies.cwd ?? runtimeCwd] });
       if (!Array.isArray(result?.data)) throw new Error('codex_hooks_response_unverifiable');
       const discoveryErrors = result.data.flatMap((entry) => (
         Array.isArray(entry?.errors) ? entry.errors : []
@@ -1153,12 +1252,11 @@ async function main(argv) {
         process.exitCode = exitCode;
       }
       if (!shutdownPromise) {
-        shutdownPromise = (async () => {
-          // Invalidate externally visible readiness before waiting for any
-          // long-running supervisor loop to wind down.
-          await processLock.release();
-          await supervisor.stop();
-        })();
+        // Retain the kernel-owned singleton lock until every supervisor loop
+        // and queued operation has stopped. A replacement process uses lock
+        // acquisition as positive proof that startup crash recovery cannot
+        // overlap a live pre-host-call dispatch.
+        shutdownPromise = shutdownSupervisorUnderLock(supervisor, processLock);
       }
       return shutdownPromise;
     };
@@ -1199,6 +1297,14 @@ async function main(argv) {
   throw new Error(`unknown_command:${command}`);
 }
 
+async function shutdownSupervisorUnderLock(supervisor, processLock) {
+  try {
+    await supervisor.stop();
+  } finally {
+    await processLock.release();
+  }
+}
+
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
   void main(process.argv.slice(2)).catch((error) => {
     process.stderr.write(`hark-codex: ${error?.message ?? String(error)}\n`);
@@ -1214,6 +1320,7 @@ export {
   openUrl,
   parseArgs,
   runProcess,
+  shutdownSupervisorUnderLock,
   wait,
   waitForSupervisorReady,
 };

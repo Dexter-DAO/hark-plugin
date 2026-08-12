@@ -18,6 +18,7 @@ import {
   onboardCommand,
   parseArgs,
   runProcess,
+  shutdownSupervisorUnderLock,
   verifyCodexSandbox,
   verifyHarkDirectToolNamespace,
   wait,
@@ -53,6 +54,54 @@ test('successful CLI delays remove their abort listener', async () => {
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
 });
 
+test('supervisor shutdown drains fully before releasing the singleton process lock', async () => {
+  const calls = [];
+  let releaseStop;
+  const stopGate = new Promise((resolve) => { releaseStop = resolve; });
+  const shutdown = shutdownSupervisorUnderLock({
+    async stop() {
+      calls.push('supervisor:stop:start');
+      await stopGate;
+      calls.push('supervisor:stop:done');
+    },
+  }, {
+    async release() {
+      calls.push('lock:release');
+    },
+  });
+  assert.deepEqual(calls, ['supervisor:stop:start']);
+  releaseStop();
+  await shutdown;
+  assert.deepEqual(calls, [
+    'supervisor:stop:start',
+    'supervisor:stop:done',
+    'lock:release',
+  ]);
+});
+
+test('supervisor shutdown releases the lock only after a quiescent stop failure', async () => {
+  const calls = [];
+  await assert.rejects(shutdownSupervisorUnderLock({
+    async stop() {
+      calls.push('supervisor:stop:start');
+      await Promise.resolve();
+      calls.push('supervisor:drained');
+      calls.push('supervisor:close');
+      throw new Error('simulated_quiescent_stop_failure');
+    },
+  }, {
+    async release() {
+      calls.push('lock:release');
+    },
+  }), /simulated_quiescent_stop_failure/);
+  assert.deepEqual(calls, [
+    'supervisor:stop:start',
+    'supervisor:drained',
+    'supervisor:close',
+    'lock:release',
+  ]);
+});
+
 test('process runner returns bounded structured failures and enforces its timeout', async () => {
   await assert.rejects(runProcess(process.execPath, [
     '-e',
@@ -75,6 +124,24 @@ test('process runner returns bounded structured failures and enforces its timeou
     assert.equal(error.signal, 'SIGKILL');
     return true;
   });
+});
+
+test('process runner uses an explicit stable cwd after the caller cwd is deleted', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'hark-process-cwd-'));
+  t.after(async () => {
+    await import('node:fs/promises').then(({ rm }) => rm(root, { recursive: true, force: true }));
+  });
+  const stableCwd = path.join(root, 'hark-data');
+  const pluginCwd = path.join(root, 'plugin-cache');
+  await import('node:fs/promises').then(({ mkdir, rm }) => Promise.all([
+    mkdir(stableCwd),
+    mkdir(pluginCwd).then(() => rm(pluginCwd, { recursive: true })),
+  ]));
+  const result = await runProcess(process.execPath, [
+    '-e',
+    'process.stdout.write(process.cwd())',
+  ], { cwd: stableCwd });
+  assert.equal(result.stdout, stableCwd);
 });
 
 function configClientFactory(fixtures, calls = []) {
@@ -231,7 +298,7 @@ test('setup leaves an already-correct direct-tool namespace untouched', async ()
   assert.equal(clients.calls.some(([name]) => name === 'writeConfigValue'), false);
 });
 
-test('setup verifies the pinned binary before non-updating daemon lifecycle mutations', async () => {
+test('setup replaces an existing daemon even when direct Hark exposure is already correct', async () => {
   const calls = [];
   const verified = [];
   const status = await bootstrapDaemonCommand({ codex: '/opt/codex-0.147.0' }, {
@@ -254,6 +321,9 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
     ensureHarkDirectToolNamespace: async () => ({
       changed: false, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
     }),
+    verifyRestartedHarkDirectToolNamespace: async () => ({
+      namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+    }),
     daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
   });
   assert.deepEqual(verified, ['/opt/codex-0.147.0']);
@@ -267,6 +337,7 @@ test('setup verifies the pinned binary before non-updating daemon lifecycle muta
     ]],
     ['/opt/codex-0.147.0', ['app-server', 'daemon', 'enable-remote-control']],
     ['/opt/codex-0.147.0', ['app-server', 'daemon', 'start']],
+    ['/opt/codex-0.147.0', ['app-server', 'daemon', 'restart']],
   ]);
   assert.equal(status.appServerVersion, '0.147.0');
   assert.equal(status.harkCodexPath, '/opt/codex-0.147.0');
@@ -292,6 +363,9 @@ test('setup restarts the daemon after adding the direct Hark namespace', async (
     }),
     ensureHarkDirectToolNamespace: async () => ({
       changed: true, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+    }),
+    verifyRestartedHarkDirectToolNamespace: async () => ({
+      namespace: 'mcp__hark', namespaces: ['mcp__hark'],
     }),
     runProcess: async (command, args) => {
       calls.push([command, args]);
@@ -463,6 +537,9 @@ test('setup installs and reuses the managed pinned runtime without launching an 
     ensureHarkDirectToolNamespace: async () => ({
       changed: false, namespace: 'mcp__hark', namespaces: ['mcp__hark'],
     }),
+    verifyRestartedHarkDirectToolNamespace: async () => ({
+      namespace: 'mcp__hark', namespaces: ['mcp__hark'],
+    }),
     daemonTransport: {
       async inspect() {
         return {
@@ -632,6 +709,8 @@ test('ensure is a no-op before connection and starts one detached supervisor whe
   assert.equal(calls[0].command, process.execPath);
   assert.deepEqual(calls[0].args.slice(-3), ['run', '--codex', '/opt/codex-0.147.0']);
   assert.equal(calls[0].options.detached, true);
+  assert.equal(calls[0].options.cwd, path.join(os.homedir(), '.codex'));
+  assert.equal(calls[0].options.env.PWD, calls[0].options.cwd);
   assert.equal(calls[0].options.env.HARK_DATA_DIR, directory);
   assert.equal(logsClosed, true);
 });
@@ -724,6 +803,8 @@ test('onboard dispatches the detached setup repair for an already-connected inco
   assert.equal(spawned[0].command, process.execPath);
   assert.equal(spawned[0].args.at(-1), 'setup');
   assert.equal(spawned[0].options.detached, true);
+  assert.equal(spawned[0].options.cwd, path.join(os.homedir(), '.codex'));
+  assert.equal(spawned[0].options.env.PWD, spawned[0].options.cwd);
   assert.equal(logsClosed, true);
 });
 
@@ -827,7 +908,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.6' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.7' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -880,7 +961,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.6', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.7', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -1290,7 +1371,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.6', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.7', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);

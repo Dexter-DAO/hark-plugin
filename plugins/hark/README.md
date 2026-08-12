@@ -17,7 +17,7 @@ are never model inputs. The parent package includes the Codex adapter.
 Add this repository as a Codex plugin marketplace and install **Hark**:
 
 ```bash
-codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.6
+codex plugin marketplace add Dexter-DAO/hark-plugin --ref v0.1.7
 codex plugin add hark@hark
 ```
 

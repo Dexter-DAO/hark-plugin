@@ -694,6 +694,39 @@ class TargetedCrashService extends FakeService {
   }
 }
 
+class DispatchIntentGate extends HarkHookInbox {
+  constructor(dataDir) {
+    super(dataDir);
+    this.intentCalls = 0;
+    this.intentEntered = new Promise((resolve) => { this.resolveIntentEntered = resolve; });
+    this.intentReleased = new Promise((resolve) => { this.resolveIntentReleased = resolve; });
+  }
+
+  async publishWakeDispatchIntent(...args) {
+    this.intentCalls += 1;
+    this.resolveIntentEntered();
+    await this.intentReleased;
+    return super.publishWakeDispatchIntent(...args);
+  }
+
+  releaseIntent() {
+    this.resolveIntentReleased();
+  }
+}
+
+class DispatchObservationJournal extends HarkJournal {
+  constructor(dataDir) {
+    super(dataDir);
+    this.dispatchingReads = 0;
+  }
+
+  async read() {
+    const journal = await super.read();
+    if (journal.wakes[TARGET_WAKE]?.state === 'dispatching') this.dispatchingReads += 1;
+    return journal;
+  }
+}
+
 function targetedCrashCertifier(artifacts, { disposition = 'recovery_authorized' } = {}) {
   const calls = [];
   const protocol = {
@@ -1849,6 +1882,48 @@ test('targeted recovery proves locally, binds detail, claims, and dispatches in 
   await environment.supervisor.stop();
 });
 
+test('periodic recovery cannot steal a live dispatch before its host-call intent', async () => {
+  const artifacts = targetedCrashArtifacts();
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-targeted-dispatch-gate-'));
+  const journal = new DispatchObservationJournal(directory);
+  const hookInbox = new DispatchIntentGate(directory);
+  const environment = await targetedCrashEnvironment({
+    artifacts,
+    journal,
+    hookInbox,
+    start: false,
+  });
+  const failures = [];
+  environment.supervisor.on('supervisorError', (error) => failures.push(error));
+  await environment.supervisor.start({ poll: true });
+  try {
+    await hookInbox.intentEntered;
+    const readsAtIntent = journal.dispatchingReads;
+    await eventually(() => {
+      assert.ok(journal.dispatchingReads > readsAtIntent);
+    });
+    const blocked = (await journal.read()).wakes[TARGET_WAKE];
+    assert.equal(blocked.state, 'dispatching');
+    assert.equal(blocked.dispatchIntent, undefined);
+    assert.equal(await hookInbox.readWakeDispatchIntent(blocked.dispatchFence), null);
+    assert.equal(hookInbox.intentCalls, 1);
+    assert.deepEqual(failures, []);
+
+    hookInbox.releaseIntent();
+    await eventually(() => {
+      assert.equal(environment.appServers.callsFor('turn/start').length, 1);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(environment.service.targetApplyCount, 1);
+    assert.equal(environment.appServers.callsFor('turn/start').length, 1);
+    assert.deepEqual(failures, []);
+    assert.ok((await journal.read()).wakes[TARGET_WAKE]);
+  } finally {
+    hookInbox.releaseIntent();
+    await environment.supervisor.stop();
+  }
+});
+
 test('a committed targeted claim with a withheld response replays identically after restart', async () => {
   const artifacts = targetedCrashArtifacts();
   const service = new TargetedCrashService(artifacts, { withholdFirstResponse: true });
@@ -1882,7 +1957,16 @@ test('a committed targeted claim with a withheld response replays identically af
 test('two supervisors racing one proof-bound claim produce one remote effect and one dispatch', async () => {
   const artifacts = targetedCrashArtifacts();
   const service = new TargetedCrashService(artifacts);
-  const first = await targetedCrashEnvironment({ artifacts, service, start: false });
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-targeted-dispatch-race-'));
+  const journal = new DispatchObservationJournal(directory);
+  const hookInbox = new DispatchIntentGate(directory);
+  const first = await targetedCrashEnvironment({
+    artifacts,
+    service,
+    journal,
+    hookInbox,
+    start: false,
+  });
   const second = await targetedCrashEnvironment({
     artifacts,
     service,
@@ -1899,22 +1983,40 @@ test('two supervisors racing one proof-bound claim produce one remote effect and
     first.supervisor.start({ poll: true }),
     second.supervisor.start({ poll: true }),
   ]);
-  await eventually(() => assert.equal(first.appServers.callsFor('turn/start').length, 1));
-  await new Promise((resolve) => setTimeout(resolve, 75));
-  assert.equal(service.targetApplyCount, 1);
-  assert.ok(service.targetRequests.length >= 1);
-  for (const request of service.targetRequests) {
-    assert.deepEqual(request, service.targetRequests[0]);
+  try {
+    await hookInbox.intentEntered;
+    const readsAtIntent = journal.dispatchingReads;
+    await eventually(() => {
+      assert.ok(journal.dispatchingReads > readsAtIntent);
+    });
+    const blocked = (await journal.read()).wakes[TARGET_WAKE];
+    assert.equal(blocked.state, 'dispatching');
+    assert.equal(blocked.dispatchIntent, undefined);
+    assert.equal(await hookInbox.readWakeDispatchIntent(blocked.dispatchFence), null);
+    assert.equal(hookInbox.intentCalls, 1);
+    assert.deepEqual(firstFailure, []);
+    assert.deepEqual(secondFailure, []);
+
+    hookInbox.releaseIntent();
+    await eventually(() => assert.equal(first.appServers.callsFor('turn/start').length, 1));
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(service.targetApplyCount, 1);
+    assert.ok(service.targetRequests.length >= 1);
+    for (const request of service.targetRequests) {
+      assert.deepEqual(request, service.targetRequests[0]);
+    }
+    assert.equal(
+      service.calls.filter((call) => call[0] === 'nextWake').length,
+      0,
+    );
+    assert.equal(first.appServers.callsFor('turn/start').length, 1);
+    assert.deepEqual(firstFailure, []);
+    assert.deepEqual(secondFailure, []);
+    assert.ok((await first.journal.read()).wakes[TARGET_WAKE]);
+  } finally {
+    hookInbox.releaseIntent();
+    await Promise.all([first.supervisor.stop(), second.supervisor.stop()]);
   }
-  assert.equal(
-    service.calls.filter((call) => call[0] === 'nextWake').length,
-    0,
-  );
-  assert.equal(first.appServers.callsFor('turn/start').length, 1);
-  assert.deepEqual(firstFailure, []);
-  assert.deepEqual(secondFailure, []);
-  assert.ok((await first.journal.read()).wakes[TARGET_WAKE]);
-  await Promise.all([first.supervisor.stop(), second.supervisor.stop()]);
 });
 
 test('targeted held-tool adoption uses the bound delivery digest and never dispatches', async () => {
@@ -2244,6 +2346,22 @@ test('a held-wait certifier poll failure reaches the supervisor fatal path', asy
   assert.equal(environment.supervisor.running, false);
   assert.equal(environment.supervisor.fatalError, error);
   await environment.supervisor.stop();
+});
+
+test('stop emits close after drain and only then surfaces a drain failure', async () => {
+  const environment = await factoryEnvironment();
+  const calls = [];
+  environment.supervisor.drain = async () => {
+    calls.push('drain');
+    throw new Error('simulated_shutdown_drain_failure');
+  };
+  environment.supervisor.once('close', () => calls.push('close'));
+  await assert.rejects(
+    environment.supervisor.stop(),
+    /simulated_shutdown_drain_failure/,
+  );
+  assert.deepEqual(calls, ['drain', 'close']);
+  assert.equal(environment.supervisor.running, false);
 });
 
 test('a certifier that exits during startup cannot produce a healthy supervisor', async () => {

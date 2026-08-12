@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
@@ -73,7 +76,7 @@ async function completeHandshake(client, transport) {
       clientInfo: {
         name: 'hark-codex-supervisor',
         title: 'Hark Codex Supervisor',
-        version: '0.1.6',
+        version: '0.1.7',
       },
       capabilities: { experimentalApi: true },
     },
@@ -93,6 +96,52 @@ async function completeHandshake(client, transport) {
     params: {},
   });
 }
+
+test('version probe and App Server transport use the configured stable cwd', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'hark-app-server-cwd-'));
+  const stableCwd = path.join(root, 'hark-data');
+  const removedPluginCwd = path.join(root, 'plugin-cache');
+  await Promise.all([mkdir(stableCwd), mkdir(removedPluginCwd)]);
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  await rm(removedPluginCwd, { recursive: true });
+
+  const transport = new FakeTransport();
+  const spawns = [];
+  const client = new AppServerClient({
+    command: '/opt/codex-0.147.0',
+    cwd: stableCwd,
+    env: { HARK_TEST_ENV: 'stable' },
+    transportFactory: async () => transport,
+    requestTimeoutMs: 1_000,
+    spawnImpl(command, args, options) {
+      const child = {
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        once(event, callback) {
+          if (event === 'close') setImmediate(() => callback(0));
+          return this;
+        },
+      };
+      spawns.push({ command, args, options, child });
+      return child;
+    },
+  });
+  const starting = client.start();
+  spawns[0].child.stdout.end('codex-cli 0.147.0\n');
+  const initialize = await transport.nextMessage();
+  transport.send({
+    id: initialize.id,
+    result: {
+      userAgent: 'codex_cli_rs/0.147.0', codexHome: '/tmp/codex-home',
+      platformFamily: 'unix', platformOs: 'linux',
+    },
+  });
+  await starting;
+  await transport.nextMessage();
+  assert.equal(spawns[0].options.cwd, stableCwd);
+  assert.deepEqual(spawns[0].options.env, { HARK_TEST_ENV: 'stable' });
+  await client.close();
+});
 
 test('performs the pinned initialize handshake and emits exact thread request shapes', async () => {
   const transport = new FakeTransport();
