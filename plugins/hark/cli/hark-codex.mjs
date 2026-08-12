@@ -126,16 +126,44 @@ function wait(ms, signal = undefined) {
   });
 }
 
-async function waitForSupervisorReady(lock, timeoutMs = 7_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const ready = await lock.inspectReady();
-    if (ready) return ready;
-    const process = await lock.inspect();
-    if (!process) throw new Error('hark_supervisor_exited_before_ready');
-    await wait(50);
+function childHasExited(child) {
+  return (
+    child?.exitCode !== null && child?.exitCode !== undefined
+  ) || (
+    child?.signalCode !== null && child?.signalCode !== undefined
+  );
+}
+
+async function waitForSupervisorReady(lock, timeoutMs = 7_000, options = {}) {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
+    throw new Error('hark_supervisor_ready_timeout_invalid');
   }
-  throw new Error('hark_supervisor_ready_timeout');
+  const deadline = Date.now() + Math.min(timeoutMs, 7_000);
+  const child = options.child ?? null;
+  const allowInitialMissingLock = options.allowInitialMissingLock === true && child !== null;
+  let observedLock = false;
+  let childExited = childHasExited(child);
+  const onChildExit = () => { childExited = true; };
+  const onChildError = () => { childExited = true; };
+  child?.once?.('exit', onChildExit);
+  child?.once?.('error', onChildError);
+  try {
+    while (Date.now() < deadline) {
+      const ready = await lock.inspectReady();
+      if (ready) return ready;
+      const process = await lock.inspect();
+      if (process) observedLock = true;
+      else if (!allowInitialMissingLock || observedLock || childExited) {
+        throw new Error('hark_supervisor_exited_before_ready');
+      }
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await wait(Math.min(50, remaining));
+    }
+    throw new Error('hark_supervisor_ready_timeout');
+  } finally {
+    child?.off?.('exit', onChildExit);
+    child?.off?.('error', onChildError);
+  }
 }
 
 function openUrl(url, spawnImpl = spawn) {
@@ -726,8 +754,9 @@ export async function ensureCommand(options = {}, dependencies = {}) {
     const ready = await (dependencies.waitForSupervisorReady ?? waitForSupervisorReady)(
       lock,
       dependencies.readyTimeoutMs ?? 7_000,
+      { allowInitialMissingLock: true, child },
     );
-    return { started: true, pid: child.pid ?? ready.pid ?? null, ready: true };
+    return { started: true, pid: ready.pid ?? child.pid ?? null, ready: true };
   } finally {
     logs.close();
   }

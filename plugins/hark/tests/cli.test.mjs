@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { getEventListeners } from 'node:events';
+import { EventEmitter, getEventListeners } from 'node:events';
 import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,6 +22,7 @@ import {
   verifyCodexSandbox,
   verifyHarkDirectToolNamespace,
   wait,
+  waitForSupervisorReady,
 } from '../cli/hark-codex.mjs';
 import { HarkCredentialsStore } from '../lib/credentials.mjs';
 import { HarkJournal } from '../lib/journal.mjs';
@@ -52,6 +53,91 @@ test('successful CLI delays remove their abort listener', async () => {
   const controller = new AbortController();
   await wait(1, controller.signal);
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('new supervisor readiness tolerates only the bounded pre-lock interval', async (t) => {
+  await t.test('delayed lock acquisition then ready succeeds', async () => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    let readyReads = 0;
+    let lockReads = 0;
+    const ready = { pid: 1234, readyAt: '2026-08-12T00:00:00.000Z' };
+    const result = await waitForSupervisorReady({
+      async inspectReady() {
+        readyReads += 1;
+        return readyReads >= 3 ? ready : null;
+      },
+      async inspect() {
+        lockReads += 1;
+        return lockReads >= 2 ? { alive: true, pid: 1234 } : null;
+      },
+    }, 500, { allowInitialMissingLock: true, child });
+    assert.deepEqual(result, ready);
+    assert.equal(getEventListeners(child, 'exit').length, 0);
+  });
+
+  await t.test('child exit before lock fails', async () => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    setTimeout(() => {
+      child.exitCode = 1;
+      child.emit('exit', 1, null);
+    }, 10);
+    await assert.rejects(waitForSupervisorReady({
+      inspectReady: async () => null,
+      inspect: async () => null,
+    }, 500, { allowInitialMissingLock: true, child }), /exited_before_ready/);
+    assert.equal(getEventListeners(child, 'exit').length, 0);
+    assert.equal(getEventListeners(child, 'error').length, 0);
+  });
+
+  await t.test('child error before lock fails', async () => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    setTimeout(() => child.emit('error', new Error('simulated_spawn_failure')), 10);
+    await assert.rejects(waitForSupervisorReady({
+      inspectReady: async () => null,
+      inspect: async () => null,
+    }, 500, { allowInitialMissingLock: true, child }), /exited_before_ready/);
+    assert.equal(getEventListeners(child, 'exit').length, 0);
+    assert.equal(getEventListeners(child, 'error').length, 0);
+  });
+
+  await t.test('lock observed then disappears fails', async () => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    let lockReads = 0;
+    await assert.rejects(waitForSupervisorReady({
+      inspectReady: async () => null,
+      async inspect() {
+        lockReads += 1;
+        return lockReads === 1 ? { alive: true, pid: 1234 } : null;
+      },
+    }, 500, { allowInitialMissingLock: true, child }), /exited_before_ready/);
+  });
+
+  await t.test('initial pre-lock wait remains bounded', async () => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    const startedAt = Date.now();
+    await assert.rejects(waitForSupervisorReady({
+      inspectReady: async () => null,
+      inspect: async () => null,
+    }, 20, { allowInitialMissingLock: true, child }), /ready_timeout/);
+    assert.ok(Date.now() - startedAt < 200);
+  });
+
+  await t.test('existing live-process readiness remains strict', async () => {
+    await assert.rejects(waitForSupervisorReady({
+      inspectReady: async () => null,
+      inspect: async () => null,
+    }, 500), /exited_before_ready/);
+  });
 });
 
 test('supervisor shutdown drains fully before releasing the singleton process lock', async () => {
@@ -679,7 +765,7 @@ test('refuses supervisor construction when Hark is not exposed as a direct tool'
   }), (error) => error?.code === 'CODEX_HARK_DIRECT_TOOL_NAMESPACE_MISSING');
 });
 
-test('ensure is a no-op before connection and starts one detached supervisor when ready', async () => {
+test('ensure starts one detached supervisor and reports an alternate ready winner', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hark-cli-'));
   const credentialsStore = new HarkCredentialsStore(directory);
   assert.deepEqual(await ensureCommand({}, { dataDir: directory, credentialsStore }), {
@@ -691,21 +777,29 @@ test('ensure is a no-op before connection and starts one detached supervisor whe
   });
   const calls = [];
   let logsClosed = false;
+  const processLock = { inspect: async () => null };
+  const spawnedChild = { pid: 1234, unref() {} };
   const result = await ensureCommand({ codex: '/opt/codex-0.147.0' }, {
     dataDir: directory,
     credentialsStore,
     verifyPinnedCodexRuntime: async () => ({ codeModeHostSha256: 'host-sha256' }),
     verifyHarkDirectToolNamespace: async () => ({ namespace: 'mcp__hark' }),
-    processLock: { inspect: async () => null },
+    processLock,
     daemonTransport: { inspect: async () => ({ appServerVersion: '0.147.0' }) },
-    waitForSupervisorReady: async () => ({ pid: 1234 }),
+    waitForSupervisorReady: async (lock, timeoutMs, readiness) => {
+      assert.equal(lock, processLock);
+      assert.equal(timeoutMs, 7_000);
+      assert.equal(readiness.allowInitialMissingLock, true);
+      assert.equal(readiness.child, spawnedChild);
+      return { pid: 5678 };
+    },
     logs: { stdout: 7, stderr: 8, close: () => { logsClosed = true; } },
     spawnImpl: (command, args, options) => {
       calls.push({ command, args, options });
-      return { pid: 1234, unref() {} };
+      return spawnedChild;
     },
   });
-  assert.deepEqual(result, { started: true, pid: 1234, ready: true });
+  assert.deepEqual(result, { started: true, pid: 5678, ready: true });
   assert.equal(calls[0].command, process.execPath);
   assert.deepEqual(calls[0].args.slice(-3), ['run', '--codex', '/opt/codex-0.147.0']);
   assert.equal(calls[0].options.detached, true);
@@ -908,7 +1002,7 @@ function doctorFixture(overrides = {}) {
       return {
         data: [{
           name: 'hark',
-          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.7' },
+          serverInfo: overrides.mcpServerInfo ?? { name: 'hark', version: '0.1.8' },
           tools: overrides.mcpTools ?? { hark_await: {} },
         }],
       };
@@ -961,7 +1055,7 @@ function doctorFixture(overrides = {}) {
         assert.equal(encoding, 'utf8');
         if (file === path.join(TEST_PLUGIN_ROOT, '.codex-plugin', 'plugin.json')) {
           return overrides.pluginManifestSource ?? JSON.stringify({
-            name: 'hark', version: '0.1.7', mcpServers: './.mcp.json',
+            name: 'hark', version: '0.1.8', mcpServers: './.mcp.json',
           });
         }
         if (file === path.join(TEST_PLUGIN_ROOT, '.mcp.json')) {
@@ -1371,7 +1465,7 @@ test('doctor fails closed on shadowed or unverifiable Hark MCP config', async (t
   await t.test('manifest must bind Codex to the exact MCP file doctor validates', async () => {
     const fixture = doctorFixture({
       pluginManifestSource: JSON.stringify({
-        name: 'hark', version: '0.1.7', mcpServers: './other.mcp.json',
+        name: 'hark', version: '0.1.8', mcpServers: './other.mcp.json',
       }),
     });
     const result = await doctorCommand({}, fixture.dependencies);
